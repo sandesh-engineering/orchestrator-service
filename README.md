@@ -10,6 +10,7 @@ Rather than allowing services to communicate directly with one another, the orch
 
 The current implementation focuses on the order fulfillment workflow:
 
+Dispatch:
 1. Payment is completed.
 2. Restaurant accepts or rejects the order.
 3. Delivery agent is assigned.
@@ -133,6 +134,8 @@ The orchestrator contains no business ownership of orders, payments, or dispatch
 ---
 
 ## Architecture
+
+## Dispatch
 
 ### Design Considerations
 

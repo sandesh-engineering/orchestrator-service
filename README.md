@@ -1,9 +1,9 @@
 #### Architecture Documentation
 
 For detailed architectural decisions, trade-off analysis, sequence diagrams, messaging patterns, and workflow design, see:
-- https://github.com/sandesh-engineering/realtime-food-delivery-system-design 
+- https://github.com/sandesh-engineering/realtime-food-delivery-system-design
 
-# Orchestrator Service
+# Orchestrator Service (WIP)
 
 A workflow orchestration service responsible for coordinating distributed business transactions across multiple microservices using the Saga Orchestration Pattern.
 
@@ -164,5 +164,3 @@ This project evolved through multiple design iterations and helped explore:
 * Reliable Event Publishing
 * Workflow State Management
 * Failure Recovery Patterns
-
-```

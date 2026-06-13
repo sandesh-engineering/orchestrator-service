@@ -5,12 +5,11 @@ import { RabbitMQEventBus } from './events/event-bus';
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
 import { OutboxService } from './services/outbox.service';
 import { datasource } from './database/data-source';
-import dotenv from 'dotenv';
 import { SagaCoordinator } from './saga-coordinator';
-import { DispatchSaga } from './steps/dispatch.step';
+import { DispatchSagaState } from './steps/dispatch.step';
 import { SagaRepository } from './repositories/saga.repository';
+import { OrchestratorListener } from './events/listeners';
 
-dotenv.config();
 
 const sdk = createTracing({
   serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
@@ -26,14 +25,15 @@ export const eventBus = new RabbitMQEventBus();
 const outboxRepository = new OrchestratorOutboxRepository(datasource);
 const sagaRepository = new SagaRepository(datasource);
 const outboxService = new OutboxService(eventBus, outboxRepository, datasource);
-const sagaCoordinator = new SagaCoordinator(
-  DispatchSaga.name,
-  [...DispatchSaga.steps],
+export const sagaCoordinator = new SagaCoordinator(
+  'dispatch-saga',
+  DispatchSagaState,
   sagaRepository,
   outboxRepository,
   eventBus,
   datasource,
 );
+export const orchestratorListener = new OrchestratorListener(sagaCoordinator);
 
 /**
  * Sleeps for a specified number of milliseconds.

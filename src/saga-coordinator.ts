@@ -1,8 +1,8 @@
 import { SagaEntity, SagaStatus } from './entities/saga.entity';
 import { SagaRepository } from './repositories/saga.repository';
-import { SagaStep } from './types/saga.types';
+import { SagaStateDefinition } from './types/saga.types';
 import { RabbitMQEventBus } from './events/event-bus';
-import { DataSource, EntityManager } from 'typeorm';
+import { DataSource, EntityManager, In } from 'typeorm';
 import { AppError, BAD_REQUEST, CONFLICT } from '@core/main';
 import { logger } from '@platform/logger';
 import {
@@ -10,7 +10,6 @@ import {
   OrchestratorOutbox,
 } from './entities/orchestrator-outbox.entity';
 
-import { withSpan, trace } from '@platform/tracing';
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
 
 export interface StepSuccessPayload {
@@ -33,24 +32,38 @@ export class SagaCoordinator {
    * and routing step success or failure events to their respective handlers.
    *
    * @param {string} name - The name of the Saga workflow.
-   * @param {SagaStep[]} steps - The steps comprising the Saga workflow.
+   * @param {SagaStateDefinition[]} steps - The steps comprising the Saga workflow.
    * @param {SagaRepository} sagaRepository - Repository for persistence of Saga states.
    * @param {RabbitMQEventBus} eventBus - RabbitMQ event bus instance.
    * @param {DataSource} datasource - TypeORM DataSource for transaction management.
    */
   constructor(
     private readonly name: string,
-    private readonly steps: SagaStep[],
+    private readonly steps: SagaStateDefinition[],
     private readonly sagaRepository: SagaRepository,
     private readonly sagaOutboxRepository: OrchestratorOutboxRepository,
     private readonly eventBus: RabbitMQEventBus,
     private readonly datasource: DataSource,
   ) {
-    logger.debug('SagaCoordinator initialized, subscribing to event bus', {
+    logger.debug('SagaCoordinator constructed', { name: this.name });
+  }
+
+  /**
+   * Subscribes to the orchestrator queue on the event bus, routing incoming messages
+   * to `onStepSuccess` or `onStepFailure` depending on their type.
+   *
+   * @remarks
+   * - Must be called **after** `RabbitMQEventBus.bootstrapRabbitMQ()` so the channel is live.
+   * - Calling it before bootstrap results in an AppError (channel not initialized).
+   *
+   * @returns {Promise<void>} Resolves when the consumer is registered with the broker.
+   */
+  async start(): Promise<void> {
+    logger.debug('SagaCoordinator subscribing to event bus', {
       name: this.name,
     });
 
-    this.eventBus.subscribe((message) => {
+    await this.eventBus.subscribe((message) => {
       if (!message) return;
 
       logger.debug('Received raw message on event bus', {
@@ -105,7 +118,8 @@ export class SagaCoordinator {
           name: this.name,
           idempotency_key,
           correlation_id,
-          payload,
+          // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
+          payload: payload ?? {},
           current_step_index: 0,
           status: SagaStatus.PENDING,
           started_at: new Date().toISOString(),
@@ -123,9 +137,9 @@ export class SagaCoordinator {
       result?.status === SagaStatus.PENDING && result?.current_step_index === 0;
 
     logger.info('Saga start resolved', {
-      sagaId: result!.id,
+      sagaId: result?.id,
       isNew,
-      status: result!.status,
+      status: result?.status,
     });
 
     return { sagaId: result?.id, isNew };
@@ -178,7 +192,8 @@ export class SagaCoordinator {
           status: SagaStatus.PENDING,
         },
         {
-          payload,
+          // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
+          payload: payload,
           status: isLastStep ? SagaStatus.COMPLETED : SagaStatus.RUNNING,
           completed_steps: () =>
             `array_append(completed_steps, '${finishedStep.name}')`,
@@ -259,6 +274,12 @@ export class SagaCoordinator {
       return;
     }
 
+    /* Steps that are to be compensated (In reverse order) */
+    const completedStates = sagaRecord.completed_steps
+      .map((name) => this.steps.find((s) => s.name === name)!)
+      .filter(Boolean)
+      .reverse();
+
     await this.datasource.transaction(async (manager) => {
       logger.debug(
         'Updating SagaEntity status to COMPENSATING and saving outbox compensation record',
@@ -269,7 +290,7 @@ export class SagaCoordinator {
         SagaEntity,
         {
           id: payload.saga_id,
-          status: SagaStatus.PENDING,
+          status: In([SagaStatus.PENDING, SagaStatus.RUNNING]),
         },
         {
           status: SagaStatus.COMPENSATING,
@@ -288,17 +309,22 @@ export class SagaCoordinator {
         sagaId: payload.saga_id,
       });
 
-      const compensationInstance = manager.create(OrchestratorOutbox, {
-        saga_id: payload.saga_id,
-        event_id: payload.event_id,
-        payload: payload as unknown as Record<string, unknown>,
-        saga_event_type: OrchestratorEventType.COMPENSATION,
-      });
+      for (const state of completedStates) {
+        if (state.compensationRoutingKey) {
+          const compensationInstance = manager.create(OrchestratorOutbox, {
+            saga_id: payload.saga_id,
+            event_id: payload.event_id,
+            routing_key: state.compensationRoutingKey,
+            payload: payload as unknown as Record<string, unknown>,
+            saga_event_type: OrchestratorEventType.COMPENSATION,
+          });
 
-      await manager.save(OrchestratorOutbox, compensationInstance);
+          await manager.save(OrchestratorOutbox, compensationInstance);
+        }
+      }
 
       logger.debug(
-        'OrchestratorOutbox compensation record created and saved in transaction',
+        'OrchestratorOutbox compensation records created and saved in transaction',
         { sagaId: payload.saga_id, eventId: payload.event_id },
       );
     });
@@ -306,74 +332,6 @@ export class SagaCoordinator {
     logger.info('Step failure processed, initiating compensation sequence', {
       sagaId: payload.saga_id,
     });
-  }
-
-  /**
-   * Executes compensation routines for all completed steps in reverse order.
-   *
-   * @param {SagaEntity} state - The current Saga state containing completed steps to undo.
-   * @returns {Promise<void>} A promise resolving when all compensating steps have executed.
-   */
-  private async compensate(state: SagaEntity): Promise<void> {
-    const toUndo = [...state.completed_steps].reverse();
-
-    logger.info('Beginning compensation sequence', {
-      sagaId: state.id,
-      stepsToUndo: toUndo,
-    });
-
-    for (const stepName of toUndo) {
-      const step = this.steps.find((s) => s.name === stepName)!;
-      logger.debug('Compensating step', { sagaId: state.id, stepName });
-      try {
-        await step.compensate?.({ saga_id: state.id, payload: state.payload });
-        logger.debug('Compensating step completed successfully', {
-          sagaId: state.id,
-          stepName,
-        });
-      } catch (err) {
-        logger.error('Failed to execute compensating step', {
-          sagaId: state.id,
-          stepName,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        // Publish to dead-letter — don't rethrow, the loop must continue
-      }
-    }
-
-    await this.sagaRepository.save({
-      ...state,
-      status: SagaStatus.COMPENSATED,
-    });
-
-    logger.info('Compensation sequence fully completed and status saved', {
-      sagaId: state.id,
-      status: SagaStatus.COMPENSATED,
-    });
-  }
-
-  /**
-   * Executes a specific workflow step.
-   *
-   * @param {object} params - Execution parameters.
-   * @param {Record<string, unknown>} params.payload - The payload to pass to the step execution.
-   * @param {number} params.index - The step index to execute.
-   * @returns {Promise<void>} A promise resolving when the step execution completes.
-   */
-  private async executeStep({
-    payload,
-    index,
-  }: {
-    payload: Record<string, unknown>;
-    index: number;
-  }): Promise<void> {
-    const step = this.steps[index];
-
-    logger.debug('Executing step', { stepName: step.name, index });
-
-    await step.execute(payload);
-
-    logger.debug('Step executed successfully', { stepName: step.name, index });
   }
 
   /**
@@ -416,20 +374,24 @@ export class SagaCoordinator {
       stepName: step.name,
     });
 
-    if (skipTransaction && manager) {
+    const routingKey = step.commandRoutingKey;
+
+    if (!skipTransaction && manager) {
       const commandInstance = manager.create(OrchestratorOutbox, {
         saga_id: sagaId,
+        routing_key: routingKey,
         payload: { ...payload, saga_id: sagaId },
         saga_event_type: OrchestratorEventType.COMMAND,
       });
 
-      await manager?.save(OrchestratorOutbox, commandInstance);
+      await manager.save(OrchestratorOutbox, commandInstance);
+    } else {
+      await this.sagaOutboxRepository.createAndSaveOutboxRecord({
+        saga_id: sagaId,
+        routing_key: routingKey,
+        payload: { ...payload, saga_id: sagaId },
+        saga_event_type: OrchestratorEventType.COMMAND,
+      });
     }
-
-    this.sagaOutboxRepository.createAndSaveOutboxRecord({
-      saga_id: sagaId,
-      payload: { ...payload, saga_id: sagaId },
-      saga_event_type: OrchestratorEventType.COMMAND,
-    });
   }
 }

@@ -19,6 +19,9 @@ export class OrchestratorOutbox {
   @Column({ type: 'varchar' })
   event_id!: string;
 
+  @Column({ type: 'varchar' })
+  routing_key!: string;
+
   @Column({ type: 'int', default: 0 })
   version!: number;
 

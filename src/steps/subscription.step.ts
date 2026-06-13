@@ -1,4 +1,4 @@
-import { SagaDefinition } from 'src/types/saga.types';
+import { SagaDefinition } from '../types/saga.types';
 
 export const SubscriptionSaga: SagaDefinition = {
   name: 'subscription-saga',

@@ -39,8 +39,9 @@ export class OutboxService {
       records.map((record) => {
         logger.debug('Publishing outbox record to event bus', {
           recordId: record.id,
+          routingKey: record.routing_key,
         });
-        return this.limit(() => this.eventBus.publish(record.payload));
+        return this.limit(() => this.eventBus.publishWithRoutingKey(record.routing_key, record.payload));
       }),
     );
 

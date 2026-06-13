@@ -36,7 +36,7 @@ export class SagaEntity {
   status!: SagaStatus;
 
   @Column({ type: 'jsonb', default: [] })
-  completed_steps!: unknown[];
+  completed_steps!: string[];
 
   @Column({ type: 'int', default: 0 })
   current_step_index!: number;

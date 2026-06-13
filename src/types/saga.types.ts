@@ -1,14 +1,9 @@
-export enum SagaStatus {
-  RUNNING = 'running',
-  COMPLETED = 'completed',
-  FAILED = 'failed',
-  COMPENSATING = 'compensating',
-}
+import { SagaStatus } from '../entities/saga.entity';
 
 export interface SagaInstance {
   id: string;
   type: string;
-  status: keyof typeof SagaStatus;
+  status: SagaStatus;
   currentStep: number;
   payload: Record<string, unknown>;
 }
@@ -40,3 +35,12 @@ export type DispatchPayload = {
   restaurant_coords: LocationCoords;
   customer_coords: LocationCoords;
 } & OrderPayload;
+
+export interface SagaStateDefinition {
+  /* Human-readable name, stored in completed_steps */
+  name: string;
+  /* Routing key the outbox poller uses to publish the forward command */
+  commandRoutingKey: string;
+  /* Routing key for compensation — undefined means non-compensable */
+  compensationRoutingKey?: string;
+}

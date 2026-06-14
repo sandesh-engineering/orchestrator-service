@@ -78,7 +78,6 @@ export class OrchestratorOutboxRepository {
       .update(OrchestratorOutbox)
       .set({
         retries: () => 'retries + 1',
-        failed_at: () => 'NOW()',
       })
       .whereInIds(ids)
       .execute();
@@ -101,5 +100,12 @@ export class OrchestratorOutboxRepository {
     const recordInstance = this.repo.create(payload);
 
     return await this.repo.save(recordInstance);
+  }
+
+  async markDeadLettered(ids: string[], manager: EntityManager): Promise<void> {
+    await manager.update(OrchestratorOutbox, ids, {
+      processed: true,
+      failed_at: () => 'NOW()',
+    });
   }
 }

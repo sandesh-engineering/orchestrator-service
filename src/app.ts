@@ -10,7 +10,6 @@ import { DispatchSagaState } from './steps/dispatch.step';
 import { SagaRepository } from './repositories/saga.repository';
 import { OrchestratorListener } from './events/listeners';
 
-
 const sdk = createTracing({
   serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
   serviceVersion: '1.0.0',

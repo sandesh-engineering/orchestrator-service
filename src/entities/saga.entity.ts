@@ -1,3 +1,4 @@
+import { SagaDomain } from 'src/enums/saga.domain.enum';
 import {
   Column,
   CreateDateColumn,
@@ -5,6 +6,7 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { OrchestratorEventType } from './orchestrator-outbox.entity';
 
 export enum SagaStatus {
   PENDING = 'PENDING',
@@ -29,6 +31,9 @@ export class SagaEntity {
   @Column({ type: 'varchar' })
   name!: string;
 
+  @Column({ type: 'enum', enum: SagaDomain, default: SagaDomain.DISPATCH })
+  domain!: SagaDomain;
+
   @Column({ type: 'jsonb' })
   payload!: Record<string, unknown>;
 
@@ -43,6 +48,20 @@ export class SagaEntity {
 
   @Column({ type: 'timestamp' })
   started_at!: string;
+
+  @Column({ type: 'jsonb', nullable: true })
+  failure_context!: {
+    routing_key: string;
+    saga_event_type: OrchestratorEventType;
+    payload: Record<string, unknown>;
+    error?: string;
+  } | null;
+
+  @Column({ type: 'int', default: 0 })
+  reprocess_count!: number;
+
+  @Column({ type: 'timestamp', nullable: true })
+  last_reprocessed_at!: string | null;
 
   @Column({ type: 'timestamp' })
   failed_at!: string;

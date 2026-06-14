@@ -1,3 +1,4 @@
+import { SagaDomain } from 'src/enums/saga.domain.enum';
 import { SagaStatus } from '../entities/saga.entity';
 
 export interface SagaInstance {
@@ -43,4 +44,16 @@ export interface SagaStateDefinition {
   commandRoutingKey: string;
   /* Routing key for compensation — undefined means non-compensable */
   compensationRoutingKey?: string;
+}
+
+/**
+ * Shape of messages published onto the orchestrator's domain-specific
+ * DLQs by `EventBusService#publishToDLQ`.
+ */
+export interface OrchestratorDlqMessage {
+  saga_id: string;
+  saga_event_type: string;
+  routing_key: string;
+  payload: Record<string, unknown>;
+  domain: SagaDomain;
 }

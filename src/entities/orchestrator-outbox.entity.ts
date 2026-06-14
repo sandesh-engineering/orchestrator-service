@@ -1,10 +1,14 @@
+import { SagaDomain } from 'src/enums/saga.domain.enum';
 import {
   Column,
   CreateDateColumn,
   Entity,
+  JoinColumn,
+  ManyToOne,
   PrimaryColumn,
   UpdateDateColumn,
 } from 'typeorm';
+import { SagaEntity } from './saga.entity';
 
 export enum OrchestratorEventType {
   COMMAND = 'COMMAND',
@@ -28,6 +32,9 @@ export class OrchestratorOutbox {
   @Column({ type: 'uuid' })
   saga_id!: string;
 
+  @Column({ type: 'enum', enum: SagaDomain, default: SagaDomain.DISPATCH })
+  domain!: SagaDomain;
+
   @Column({
     type: 'enum',
     enum: OrchestratorEventType,
@@ -47,6 +54,7 @@ export class OrchestratorOutbox {
   @Column({ type: 'timestamp', nullable: true })
   processed_at!: Date | null;
 
+  /* For DLQ */
   @Column({ type: 'timestamp', nullable: true })
   failed_at!: Date | null;
 
@@ -55,4 +63,8 @@ export class OrchestratorOutbox {
 
   @UpdateDateColumn()
   updated_at!: Date;
+
+  @ManyToOne(() => SagaEntity)
+  @JoinColumn({ name: 'saga_id' })
+  saga?: SagaEntity;
 }

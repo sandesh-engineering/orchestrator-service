@@ -6,15 +6,22 @@ import {
 } from '@platform/queue-rabbitmq';
 
 import { AppError, BAD_REQUEST } from '@core/main';
+import { SagaDomain } from 'src/enums/saga.domain.enum';
+import { OrchestratorEventType } from 'src/entities/orchestrator-outbox.entity';
+import { DLQ_QUEUE_NAMES } from 'src/constants/saga.constants';
 
 export class RabbitMQEventBus {
   private readonly ORCHESTRATOR_TYPE = 'direct';
   private readonly ORCHESTRATOR_ROUTING_KEY = 'orchestrator-routing-key';
   private readonly ORCHESTRATOR_EXCHANGE = 'orchestrator-exchange';
   private readonly ORCHESTRATOR_QUEUE = 'orchestrator-queue';
-  private readonly ORCHESTRATOR_DLQ_EXCHANGE = 'orchestrator-dlq';
+
+  private readonly ORCHESTRATOR_DLQ_TYPE = 'topic';
+  private readonly ORCHESTRATOR_DLQ_EXCHANGE = 'orchestrator.dlq.exchange';
 
   private channel: Channel | null = null;
+
+  private readonly;
 
   /**
    * Bootstraps RabbitMQ connection, asserting exchanges, queues, and binds them.
@@ -27,7 +34,7 @@ export class RabbitMQEventBus {
       heartbeat: 60,
       username: process.env.RABBITMQ_1_DEFAULT_USER,
       password: process.env.RABBITMQ_1_DEFAULT_PASS,
-    });    
+    });
 
     const rabbitmqService = new RabbitMQService(manager);
 
@@ -63,6 +70,58 @@ export class RabbitMQEventBus {
       this.ORCHESTRATOR_QUEUE,
       this.ORCHESTRATOR_EXCHANGE,
       this.ORCHESTRATOR_ROUTING_KEY,
+    );
+
+    /* Setting up DLQs on bus initiation */
+    await this.setupDLQTopology();
+  }
+
+  /* Setting up DLQs based on domain */
+  async setupDLQTopology(): Promise<void> {
+    if (!this.channel)
+      throw new AppError(
+        false,
+        'Rabbitmq channel not initialized!',
+        BAD_REQUEST,
+        true,
+      );
+
+    /* Dispatch DLQ */
+    await this.channel.assertExchange(
+      this.ORCHESTRATOR_DLQ_EXCHANGE,
+      this.ORCHESTRATOR_DLQ_TYPE,
+      {
+        durable: true,
+      },
+    );
+
+    await this.channel.assertQueue(DLQ_QUEUE_NAMES[SagaDomain.DISPATCH], {
+      durable: true,
+      arguments: {
+        'x-message-ttl':
+          1000 *
+          60 *
+          60 *
+          24 *
+          7 /* Since we don't really manually reprocess dispatch DLQ events */,
+      },
+    });
+
+    await this.channel.bindQueue(
+      DLQ_QUEUE_NAMES[SagaDomain.DISPATCH],
+      this.ORCHESTRATOR_DLQ_EXCHANGE,
+      `dlq.${SagaDomain.DISPATCH}.#`,
+    );
+
+    /* Subscription DLQ */
+    await this.channel.assertQueue(DLQ_QUEUE_NAMES[SagaDomain.SUBSCRIPTION], {
+      durable: true,
+    });
+
+    await this.channel.bindQueue(
+      DLQ_QUEUE_NAMES[SagaDomain.SUBSCRIPTION],
+      this.ORCHESTRATOR_DLQ_EXCHANGE,
+      `dlq.${SagaDomain.SUBSCRIPTION}.#`,
     );
   }
 
@@ -100,7 +159,10 @@ export class RabbitMQEventBus {
    * @param {unknown} payload - The payload to publish.
    * @returns {Promise<void>} A promise resolving when publishing completes.
    */
-  async publishWithRoutingKey(routingKey: string, payload: unknown): Promise<void> {
+  async publishWithRoutingKey(
+    routingKey: string,
+    payload: unknown,
+  ): Promise<void> {
     if (!this.channel)
       throw new AppError(
         false,
@@ -127,7 +189,13 @@ export class RabbitMQEventBus {
    * @param {unknown} payload - The payload to publish.
    * @returns {Promise<void>} A promise resolving when publishing completes.
    */
-  async publishToDLQ(payload: unknown): Promise<void> {
+  async publishToDLQ(payload: {
+    payload: unknown;
+    saga_id: string;
+    saga_event_type: OrchestratorEventType;
+    domain: string;
+    routing_key: string;
+  }): Promise<void> {
     if (!this.channel)
       throw new AppError(
         false,
@@ -136,10 +204,20 @@ export class RabbitMQEventBus {
         true,
       );
 
+    const dlqRoutingKey = `dlq.${payload.domain}.${payload.saga_event_type}`;
+
+    const dlqMessage = {
+      payload: payload.payload,
+      saga_id: payload.saga_id,
+      saga_event_type: payload.saga_event_type,
+      routing_key: payload.routing_key,
+      domain: payload.domain,
+    };
+
     const ok = this.channel.publish(
       this.ORCHESTRATOR_DLQ_EXCHANGE,
-      this.ORCHESTRATOR_ROUTING_KEY,
-      Buffer.from(JSON.stringify(payload)),
+      dlqRoutingKey,
+      Buffer.from(JSON.stringify(dlqMessage)),
       { mandatory: true, persistent: true },
     );
 
@@ -156,6 +234,7 @@ export class RabbitMQEventBus {
    */
   async subscribe(
     callback: (message: ConsumeMessage | null) => void,
+    queueName?: string,
   ): Promise<void> {
     if (!this.channel)
       throw new AppError(
@@ -168,7 +247,7 @@ export class RabbitMQEventBus {
     /* We can only distinguish the suitable number for this once we start testing so for now 30 */
     await this.channel.prefetch(30);
 
-    await this.channel.consume(this.ORCHESTRATOR_QUEUE, callback);
+    await this.channel.consume(queueName ?? this.ORCHESTRATOR_QUEUE, callback);
   }
 
   /**

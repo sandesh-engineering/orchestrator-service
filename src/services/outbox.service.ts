@@ -41,7 +41,12 @@ export class OutboxService {
           recordId: record.id,
           routingKey: record.routing_key,
         });
-        return this.limit(() => this.eventBus.publishWithRoutingKey(record.routing_key, record.payload));
+        return this.limit(() =>
+          this.eventBus.publishWithRoutingKey(
+            record.routing_key,
+            record.payload,
+          ),
+        );
       }),
     );
 
@@ -65,7 +70,15 @@ export class OutboxService {
       });
       await Promise.all(
         dlqEvents.map((event) =>
-          this.limit(() => this.eventBus.publishToDLQ(event.payload)),
+          this.limit(() =>
+            this.eventBus.publishToDLQ({
+              payload: event.payload,
+              saga_id: event.saga_id,
+              saga_event_type: event.saga_event_type,
+              routing_key: event.routing_key,
+              domain: event.domain,
+            }),
+          ),
         ),
       );
     }
@@ -81,11 +94,12 @@ export class OutboxService {
         },
       );
 
-      if (successIds.length > 0 || dlqIds.length > 0) {
-        await this.outboxRepository.markProcessed(
-          [...successIds, ...dlqIds],
-          manager,
-        );
+      if (successIds.length > 0) {
+        await this.outboxRepository.markProcessed(successIds, manager);
+      }
+
+      if (dlqIds.length > 0) {
+        await this.outboxRepository.markDeadLettered(dlqIds, manager);
       }
 
       if (failedIds.length > 0) {

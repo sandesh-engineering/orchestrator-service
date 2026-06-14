@@ -2,7 +2,7 @@ import { SagaEntity, SagaStatus } from './entities/saga.entity';
 import { SagaRepository } from './repositories/saga.repository';
 import { SagaStateDefinition } from './types/saga.types';
 import { RabbitMQEventBus } from './events/event-bus';
-import { DataSource, EntityManager, In } from 'typeorm';
+import { DataSource, EntityManager, In, Not } from 'typeorm';
 import { AppError, BAD_REQUEST, CONFLICT } from '@core/main';
 import { logger } from '@platform/logger';
 import {
@@ -393,5 +393,39 @@ export class SagaCoordinator {
         saga_event_type: OrchestratorEventType.COMMAND,
       });
     }
+  }
+
+  async markSagaAsFailed(
+    saga_id: string,
+    failure_context: {
+      routing_key: string;
+      saga_event_type: string;
+      payload: Record<string, unknown>;
+    },
+  ) {
+    if (!saga_id) {
+      logger.warn('Saga id missing. Skipping marking saga as failed!');
+    }
+
+    const updateMetadata = await this.sagaRepository.update({
+      whereClause: { id: saga_id, status: Not(SagaStatus.FAILED) },
+      payload: {
+        status: SagaStatus.FAILED,
+        failure_context,
+        failed_at: () => 'NOW()',
+      },
+    });
+
+    if (updateMetadata.affected === 0) {
+      logger.error('Saga already marked as failed', { sagaId: saga_id });
+      throw new AppError(
+        false,
+        'Saga already marked as failed!',
+        BAD_REQUEST,
+        true,
+      );
+    }
+
+    logger.info('Saga marked as failed!', { sagaId: saga_id });
   }
 }

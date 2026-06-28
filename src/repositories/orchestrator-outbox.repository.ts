@@ -27,6 +27,9 @@ export class OrchestratorOutboxRepository {
           'orchestrator_outbox.payload',
           'orchestrator_outbox.retries',
           'orchestrator_outbox.routing_key',
+          'orchestrator_outbox.saga_id',
+          'orchestrator_outbox.saga_event_type',
+          'orchestrator_outbox.domain',
         ])
         .where('orchestrator_outbox.processed = :processed', {
           processed: false,
@@ -92,7 +95,7 @@ export class OrchestratorOutboxRepository {
   async findEventsByIds(ids: string[]): Promise<OrchestratorOutbox[]> {
     return await this.repo.find({
       where: { id: In(ids) },
-      select: ['id', 'payload', 'retries', 'routing_key'],
+      select: ['id', 'payload', 'retries', 'routing_key', 'saga_id', 'saga_event_type', 'domain'],
     });
   }
 

@@ -6,9 +6,10 @@ import {
 } from '@platform/queue-rabbitmq';
 
 import { AppError, BAD_REQUEST } from '@core/main';
-import { SagaDomain } from 'src/enums/saga.domain.enum';
-import { OrchestratorEventType } from 'src/entities/orchestrator-outbox.entity';
-import { DLQ_QUEUE_NAMES } from 'src/constants/saga.constants';
+import { logger } from '@platform/logger';
+import { SagaDomain } from '../enums/saga.domain.enum';
+import { OrchestratorEventType } from '../enums/orchestrator-event-type.enum';
+import { DLQ_QUEUE_NAMES } from '../constants/saga.constants';
 
 export class RabbitMQEventBus {
   private readonly ORCHESTRATOR_TYPE = 'direct';
@@ -20,8 +21,7 @@ export class RabbitMQEventBus {
   private readonly ORCHESTRATOR_DLQ_EXCHANGE = 'orchestrator.dlq.exchange';
 
   private channel: Channel | null = null;
-
-  private readonly;
+  private manager: ConnectionManager | null = null;
 
   /**
    * Bootstraps RabbitMQ connection, asserting exchanges, queues, and binds them.
@@ -29,14 +29,14 @@ export class RabbitMQEventBus {
    * @returns {Promise<void>} A promise resolving when RabbitMQ is fully bootstrapped.
    */
   async bootstrapRabbitMQ(): Promise<void> {
-    const manager = new ConnectionManager({
+    this.manager = new ConnectionManager({
       url: String(process.env.RABBITMQ_1_CONNECTION_URL),
       heartbeat: 60,
       username: process.env.RABBITMQ_1_DEFAULT_USER,
       password: process.env.RABBITMQ_1_DEFAULT_PASS,
     });
 
-    const rabbitmqService = new RabbitMQService(manager);
+    const rabbitmqService = new RabbitMQService(this.manager);
 
     /* Initialize the connection */
     await rabbitmqService.init();
@@ -56,15 +56,14 @@ export class RabbitMQEventBus {
       },
     );
 
-    await this.channel.assertExchange(
-      this.ORCHESTRATOR_DLQ_EXCHANGE,
-      'direct',
-      {
-        durable: true,
+    /* Note: DLQ exchange is asserted as 'topic' in setupDLQTopology() — no duplicate here */
+    await this.channel.assertQueue(this.ORCHESTRATOR_QUEUE, {
+      durable: true,
+      arguments: {
+        /* Nacked messages route automatically to the DLQ exchange */
+        'x-dead-letter-exchange': this.ORCHESTRATOR_DLQ_EXCHANGE,
       },
-    );
-
-    await this.channel.assertQueue(this.ORCHESTRATOR_QUEUE, { durable: true });
+    });
 
     await this.channel.bindQueue(
       this.ORCHESTRATOR_QUEUE,
@@ -74,6 +73,13 @@ export class RabbitMQEventBus {
 
     /* Setting up DLQs on bus initiation */
     await this.setupDLQTopology();
+  }
+
+  /**
+   * Checks if the RabbitMQ channel is connected.
+   */
+  getIsConnected(): boolean {
+    return this.channel !== null;
   }
 
   /* Setting up DLQs based on domain */
@@ -104,6 +110,8 @@ export class RabbitMQEventBus {
           60 *
           24 *
           7 /* Since we don't really manually reprocess dispatch DLQ events */,
+        'x-max-length': 1000,
+        'x-overflow': 'reject-publish',
       },
     });
 
@@ -113,9 +121,14 @@ export class RabbitMQEventBus {
       `dlq.${SagaDomain.DISPATCH}.#`,
     );
 
-    /* Subscription DLQ */
+    /* Subscription DLQ — 30-day retention, capped at 10k messages */
     await this.channel.assertQueue(DLQ_QUEUE_NAMES[SagaDomain.SUBSCRIPTION], {
       durable: true,
+      arguments: {
+        'x-message-ttl': 1000 * 60 * 60 * 24 * 30 /* 30 days */,
+        'x-max-length': 10_000,
+        'x-overflow': 'reject-publish',
+      },
     });
 
     await this.channel.bindQueue(
@@ -227,13 +240,15 @@ export class RabbitMQEventBus {
   }
 
   /**
-   * Subscribes to the orchestrator queue, invoking the callback when a message is received.
+   * Subscribes to a queue, invoking the async callback when a message is received.
+   * Automatically acks on success and nacks (no requeue) on callback failure.
    *
-   * @param {function} callback - Callback invoked with the message.
+   * @param {function} callback - Async callback invoked with the message.
+   * @param {string} [queueName] - Optional override queue name; defaults to the orchestrator queue.
    * @returns {Promise<void>} A promise resolving when the subscription is established.
    */
   async subscribe(
-    callback: (message: ConsumeMessage | null) => void,
+    callback: (message: ConsumeMessage | null) => Promise<void>,
     queueName?: string,
   ): Promise<void> {
     if (!this.channel)
@@ -244,10 +259,24 @@ export class RabbitMQEventBus {
         true,
       );
 
-    /* We can only distinguish the suitable number for this once we start testing so for now 30 */
-    await this.channel.prefetch(30);
+    const channel = this.channel;
 
-    await this.channel.consume(queueName ?? this.ORCHESTRATOR_QUEUE, callback);
+    /* We can only distinguish the suitable number for this once we start testing so for now 30 */
+    await channel.prefetch(30);
+
+    await channel.consume(queueName ?? this.ORCHESTRATOR_QUEUE, async (msg) => {
+      if (!msg) return;
+      try {
+        await callback(msg);
+        channel.ack(msg);
+      } catch (err) {
+        logger.error('Failed to process queued message — nacking without requeue', {
+          queue: queueName ?? this.ORCHESTRATOR_QUEUE,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        channel.nack(msg, false, false);
+      }
+    });
   }
 
   /**
@@ -265,7 +294,7 @@ export class RabbitMQEventBus {
    * @throws {AppError} Throws with HTTP 400 if the channel has not been initialized.
    */
   async subscribeToPaymentEvents(
-    callback: (message: ConsumeMessage | null) => void,
+    callback: (message: ConsumeMessage | null) => Promise<void>,
   ): Promise<void> {
     if (!this.channel)
       throw new AppError(
@@ -275,26 +304,67 @@ export class RabbitMQEventBus {
         true,
       );
 
-    const PAYMENT_EXCHANGE = 'payment.exchange';
-    const PAYMENT_ROUTING_KEY = 'payment.v1.order.succeeded';
+    const PAYMENT_EXCHANGE =
+      process.env.PAYMENT_RABBITMQ_EXCHANGE ?? 'payment.exchange';
+    const PAYMENT_ROUTING_KEY =
+      process.env.PAYMENT_RABBITMQ_ROUTING_KEY ?? 'payment.v1.order.succeeded';
     const PAYMENT_CONSUMER_QUEUE = 'orchestrator.payment.succeeded.queue';
 
+    const channel = this.channel;
+
     /* Assert the upstream payment exchange as a topic — safe to re-assert with same args */
-    await this.channel.assertExchange(PAYMENT_EXCHANGE, 'topic', {
+    await channel.assertExchange(PAYMENT_EXCHANGE, 'topic', {
       durable: true,
     });
 
     /* Assert and bind a dedicated queue so the orchestrator only receives order-succeeded events */
-    await this.channel.assertQueue(PAYMENT_CONSUMER_QUEUE, { durable: true });
+    await channel.assertQueue(PAYMENT_CONSUMER_QUEUE, { durable: true });
 
-    await this.channel.bindQueue(
+    await channel.bindQueue(
       PAYMENT_CONSUMER_QUEUE,
       PAYMENT_EXCHANGE,
       PAYMENT_ROUTING_KEY,
     );
 
-    await this.channel.prefetch(30);
+    await channel.prefetch(30);
 
-    await this.channel.consume(PAYMENT_CONSUMER_QUEUE, callback);
+    await channel.consume(PAYMENT_CONSUMER_QUEUE, async (msg) => {
+      if (!msg) return;
+      try {
+        await callback(msg);
+        channel.ack(msg);
+      } catch (err) {
+        logger.error('Failed to process payment event — nacking without requeue', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        channel.nack(msg, false, false);
+      }
+    });
+  }
+
+  /**
+   * Closes the RabbitMQ channel and connection manager cleanly.
+   */
+  async close(): Promise<void> {
+    if (this.channel) {
+      try {
+        await this.channel.close();
+      } catch (err) {
+        logger.error('Error closing channel during shutdown', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      this.channel = null;
+    }
+    if (this.manager) {
+      try {
+        await this.manager.close();
+      } catch (err) {
+        logger.error('Error closing connection manager during shutdown', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      this.manager = null;
+    }
   }
 }

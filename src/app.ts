@@ -1,3 +1,4 @@
+import express, { Application } from 'express';
 import { logger } from '@platform/logger';
 import { createTracing } from '@platform/tracing';
 
@@ -10,10 +11,27 @@ import { DispatchSagaState } from './steps/dispatch.step';
 import { SagaRepository } from './repositories/saga.repository';
 import { OrchestratorListener } from './events/listeners';
 
+export const app: Application = express();
+
+app.get(['/health', '/ready'], (req, res) => {
+  const isDbConnected = datasource.isInitialized;
+  const isRabbitConnected = eventBus.getIsConnected();
+
+  if (isDbConnected && isRabbitConnected) {
+    res.status(200).json({ status: 'UP', database: 'UP', rabbitmq: 'UP' });
+  } else {
+    res.status(503).json({
+      status: 'DOWN',
+      database: isDbConnected ? 'UP' : 'DOWN',
+      rabbitmq: isRabbitConnected ? 'UP' : 'DOWN',
+    });
+  }
+});
+
 const sdk = createTracing({
   serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
   serviceVersion: '1.0.0',
-  collectorUrl: 'http://localhost:4317',
+  collectorUrl: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4317',
   samplingRatio: 0.3,
 });
 
@@ -44,13 +62,23 @@ const sleep = (ms: number): Promise<void> => {
   return new Promise((resolve) => setTimeout(resolve, ms));
 };
 
+let pollingActive = true;
+
+/**
+ * Stops the outbox polling loop gracefully.
+ */
+export function stopPolling(): void {
+  pollingActive = false;
+}
+
 /**
  * Starts the outbox polling loop, calling `poll` repeatedly.
  *
- * @returns {Promise<void>} A promise resolving when the polling loop finishes (infinite loop).
+ * @returns {Promise<void>} A promise resolving when the polling loop finishes.
  */
 export async function startPolling(): Promise<void> {
-  while (true) {
+  pollingActive = true;
+  while (pollingActive) {
     try {
       await outboxService.poll();
     } catch (error) {
@@ -63,6 +91,8 @@ export async function startPolling(): Promise<void> {
       logger.error(error);
     }
 
-    await sleep(3000);
+    if (pollingActive) {
+      await sleep(3000);
+    }
   }
 }

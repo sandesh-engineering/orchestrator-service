@@ -1,4 +1,4 @@
-import { SagaDomain } from 'src/enums/saga.domain.enum';
+import { SagaDomain } from '../enums/saga.domain.enum';
 import { SagaStatus } from '../entities/saga.entity';
 
 export interface SagaInstance {

@@ -1,4 +1,4 @@
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, FindManyOptions, FindOneOptions, Repository } from 'typeorm';
 import { SagaEntity } from '../entities/saga.entity';
 
 export class SagaRepository {
@@ -64,5 +64,41 @@ export class SagaRepository {
         payload: true,
       },
     });
+  }
+
+  /**
+   * Finds SagaEntity records matching the given TypeORM find options.
+   *
+   * @param {FindManyOptions<SagaEntity>} options - TypeORM find options.
+   * @returns {Promise<SagaEntity[]>} A promise resolving to the matching entities.
+   */
+  async find(options: FindManyOptions<SagaEntity>): Promise<SagaEntity[]> {
+    return this.sagaRepo.find(options);
+  }
+
+  /**
+   * Finds a single SagaEntity or throws an EntityNotFoundError.
+   *
+   * @param {FindOneOptions<SagaEntity>} options - TypeORM find-one options.
+   * @returns {Promise<SagaEntity>} A promise resolving to the found entity.
+   */
+  async findOneOrFail(options: FindOneOptions<SagaEntity>): Promise<SagaEntity> {
+    return this.sagaRepo.findOneOrFail(options);
+  }
+
+  /**
+   * Updates a SagaEntity by its ID with the provided partial payload.
+   *
+   * @param {string} id - The saga ID.
+   * @param {Partial<SagaEntity>} payload - Fields to update.
+   * @returns {Promise<import('typeorm').UpdateResult>} TypeORM update result.
+   */
+  async updateById(
+    id: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    payload: Partial<SagaEntity>,
+  ): Promise<import('typeorm').UpdateResult> {
+    // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
+    return this.sagaRepo.update({ id }, payload);
   }
 }

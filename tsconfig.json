@@ -23,6 +23,6 @@
     "composite": true
   },
 
-  "include": ["src/**/*.ts", "src/saga.entity-ts"],
+  "include": ["src/**/*.ts"],
   "exclude": ["node_modules"]
 }

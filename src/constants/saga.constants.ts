@@ -1,4 +1,4 @@
-import { SagaDomain } from 'src/enums/saga.domain.enum';
+import { SagaDomain } from '../enums/saga.domain.enum';
 
 export const COMMANDS = {
   REQUEST_ORDER_ACCEPTANCE_V1: 'order.v1.request-acceptance',

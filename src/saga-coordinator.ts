@@ -6,9 +6,9 @@ import { DataSource, EntityManager, In, Not } from 'typeorm';
 import { AppError, BAD_REQUEST, CONFLICT } from '@core/main';
 import { logger } from '@platform/logger';
 import {
-  OrchestratorEventType,
   OrchestratorOutbox,
 } from './entities/orchestrator-outbox.entity';
+import { OrchestratorEventType } from './enums/orchestrator-event-type.enum';
 
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
 
@@ -63,7 +63,7 @@ export class SagaCoordinator {
       name: this.name,
     });
 
-    await this.eventBus.subscribe((message) => {
+    await this.eventBus.subscribe(async (message) => {
       if (!message) return;
 
       logger.debug('Received raw message on event bus', {
@@ -80,10 +80,19 @@ export class SagaCoordinator {
         eventId: payload.event_id,
       });
 
-      if (payload.type === 'STEP_SUCCESS') {
-        this.onStepSuccess(payload);
-      } else if (payload.type === 'STEP_FAILURE') {
-        this.onStepFailure(payload);
+      try {
+        if (payload.type === 'STEP_SUCCESS') {
+          await this.onStepSuccess(payload);
+        } else if (payload.type === 'STEP_FAILURE') {
+          await this.onStepFailure(payload);
+        }
+      } catch (err: unknown) {
+        logger.error('Unhandled error in saga message handler', {
+          type: payload.type,
+          sagaId: payload.saga_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
     });
   }
@@ -405,6 +414,7 @@ export class SagaCoordinator {
   ) {
     if (!saga_id) {
       logger.warn('Saga id missing. Skipping marking saga as failed!');
+      return;
     }
 
     const updateMetadata = await this.sagaRepository.update({

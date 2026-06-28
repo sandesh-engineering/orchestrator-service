@@ -1,23 +1,19 @@
-import { SagaDomain } from 'src/enums/saga.domain.enum';
+import { SagaDomain } from '../enums/saga.domain.enum';
+import { OrchestratorEventType } from '../enums/orchestrator-event-type.enum';
 import {
   Column,
   CreateDateColumn,
   Entity,
   JoinColumn,
   ManyToOne,
-  PrimaryColumn,
+  PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { SagaEntity } from './saga.entity';
 
-export enum OrchestratorEventType {
-  COMMAND = 'COMMAND',
-  COMPENSATION = 'COMPENSATION',
-}
-
 @Entity({ name: 'orchestrator_outbox' })
 export class OrchestratorOutbox {
-  @PrimaryColumn({ type: 'uuid' })
+  @PrimaryGeneratedColumn('uuid')
   id!: string;
 
   @Column({ type: 'varchar' })

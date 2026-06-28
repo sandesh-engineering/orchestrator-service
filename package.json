@@ -26,6 +26,7 @@
     "@platform/queue-rabbitmq": "workspace:*",
     "@platform/tracing": "workspace:*",
     "dotenv": "^17.2.3",
+    "express": "^5.2.1",
     "p-limit": "^7.3.0",
     "pg": "^8.18.0",
     "prom-client": "^15.1.3",

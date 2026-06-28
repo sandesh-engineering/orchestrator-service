@@ -14,11 +14,9 @@ export const DispatchSagaState: SagaStateDefinition[] = [
   {
     name: 'NOTIFY_AGENTS',
     commandRoutingKey: 'dispatch.notify-agents',
-    compensationRoutingKey: '',
   },
   {
     name: 'CONFIRM_AGENT_ASSIGNMENT',
     commandRoutingKey: 'dispatch.confirm-agent-assignment',
-    compensationRoutingKey: '',
   },
 ];

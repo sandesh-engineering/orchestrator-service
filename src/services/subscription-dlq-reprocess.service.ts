@@ -1,6 +1,7 @@
-import { SagaEntity, SagaStatus } from 'src/entities/saga.entity';
-import { SagaDomain } from 'src/enums/saga.domain.enum';
-import { RabbitMQEventBus } from 'src/events/event-bus';
+import { SagaEntity, SagaStatus } from '../entities/saga.entity';
+import { SagaDomain } from '../enums/saga.domain.enum';
+import { RabbitMQEventBus } from '../events/event-bus';
+import { SagaRepository } from '../repositories/saga.repository';
 
 /**
  * Backs the "subscription failures awaiting reprocess" admin view,
@@ -12,8 +13,8 @@ import { RabbitMQEventBus } from 'src/events/event-bus';
  */
 export class SubscriptionReprocessService {
   constructor(
-    private readonly sagaRepository: SagaRepository, // adjust to your actual repo type
-    private readonly eventBus: RabbitMQEventBus, // adjust to your actual type/path
+    private readonly sagaRepository: SagaRepository,
+    private readonly eventBus: RabbitMQEventBus,
   ) {}
 
   /**
@@ -65,7 +66,7 @@ export class SubscriptionReprocessService {
       saga.failure_context.payload,
     );
 
-    await this.sagaRepository.update(sagaId, {
+    await this.sagaRepository.updateById(sagaId, {
       status: SagaStatus.RUNNING,
       reprocess_count: saga.reprocess_count + 1,
       last_reprocessed_at: new Date().toISOString(),

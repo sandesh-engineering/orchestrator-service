@@ -1,7 +1,7 @@
 import { ConsumeMessage } from '@platform/queue-rabbitmq';
 import { logger } from '@platform/logger';
 import { SagaCoordinator } from '../saga-coordinator';
-import { OrchestratorDlqMessage } from 'src/types/saga.types';
+import { OrchestratorDlqMessage } from '../types/saga.types';
 
 /**
  * Typed shape of the event published by the payment service on `payment.v1.order.succeeded`.
@@ -159,7 +159,7 @@ export class OrchestratorListener {
 
     /* Here we are logging for now but we need to setup alerting since this is revenue impacting step */
     logger.error(
-      'Subscription saga ${raw.saga_id} failed at step "${raw.saga_event_type}" and needs manual reprocessing.',
+      `Subscription saga ${raw.saga_id} failed at step "${raw.saga_event_type}" and needs manual reprocessing.`,
       { channel: 'subscription-failures' },
     );
   };

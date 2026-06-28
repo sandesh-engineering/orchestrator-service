@@ -13,25 +13,11 @@ import { OrchestratorListener } from './events/listeners';
 
 export const app: Application = express();
 
-app.get(['/health', '/ready'], (req, res) => {
-  const isDbConnected = datasource.isInitialized;
-  const isRabbitConnected = eventBus.getIsConnected();
-
-  if (isDbConnected && isRabbitConnected) {
-    res.status(200).json({ status: 'UP', database: 'UP', rabbitmq: 'UP' });
-  } else {
-    res.status(503).json({
-      status: 'DOWN',
-      database: isDbConnected ? 'UP' : 'DOWN',
-      rabbitmq: isRabbitConnected ? 'UP' : 'DOWN',
-    });
-  }
-});
-
 const sdk = createTracing({
   serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
   serviceVersion: '1.0.0',
-  collectorUrl: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4317',
+  collectorUrl:
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4317',
   samplingRatio: 0.3,
 });
 
@@ -51,6 +37,22 @@ export const sagaCoordinator = new SagaCoordinator(
   datasource,
 );
 export const orchestratorListener = new OrchestratorListener(sagaCoordinator);
+
+/* HEALTH CHECK ROUTE */
+app.get(['/health', '/ready'], (req, res) => {
+  const isDbConnected = datasource.isInitialized;
+  const isRabbitConnected = eventBus.getIsConnected();
+
+  if (isDbConnected && isRabbitConnected) {
+    res.status(200).json({ status: 'UP', database: 'UP', rabbitmq: 'UP' });
+  } else {
+    res.status(503).json({
+      status: 'DOWN',
+      database: isDbConnected ? 'UP' : 'DOWN',
+      rabbitmq: isRabbitConnected ? 'UP' : 'DOWN',
+    });
+  }
+});
 
 /**
  * Sleeps for a specified number of milliseconds.

@@ -12,7 +12,6 @@ import { logger } from '@platform/logger';
 import { datasource } from './database/data-source';
 import { DLQ_QUEUE_NAMES } from './constants/saga.constants';
 
-
 let server: Server | null = null;
 let isShuttingDown = false;
 
@@ -66,8 +65,6 @@ let isShuttingDown = false;
   }
 })();
 
-
-
 /* Handle uncaught exceptions and unhandled rejections to prevent silent failures */
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled promise rejection', { reason: String(reason) });
@@ -81,8 +78,6 @@ process.on('uncaughtException', (err) => {
   });
   process.exit(1);
 });
-
-
 
 const shutdown = async (signal: string) => {
   if (isShuttingDown) return;

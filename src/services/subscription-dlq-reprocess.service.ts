@@ -4,12 +4,14 @@ import { RabbitMQEventBus } from '../events/event-bus';
 import { SagaRepository } from '../repositories/saga.repository';
 
 /**
- * Backs the "subscription failures awaiting reprocess" admin view,
- * and the action that actually replays a failed step.
+ * Powers both the admin "subscription failures awaiting reprocess" view and
+ * the action that replays a failed step back onto the exchange.
  *
- * The saga table is the source of truth for "what needs attention" —
- * RabbitMQ's subscription DLQ is just transport; SubscriptionDLQConsumer
- * already drained it into saga.status/failure_context.
+ * @remarks
+ * The saga table is the authoritative source for "what needs attention":
+ * the subscription DLQ is only a transport mechanism — `SubscriptionDLQConsumer`
+ * already drained it into `saga.status` and `saga.failure_context` before
+ * this service is involved.
  */
 export class SubscriptionReprocessService {
   constructor(
@@ -18,11 +20,14 @@ export class SubscriptionReprocessService {
   ) {}
 
   /**
-   * Powers the admin dashboard:
-   *   SELECT * FROM saga
-   *   WHERE domain = 'subscription' AND status = 'FAILED'
-   *   ORDER BY failed_at ASC
-   * (covered by idx_saga_domain_status)
+   * Returns all subscription-domain sagas that are currently in a FAILED state,
+   * ordered oldest-failure-first for prioritised reprocessing.
+   *
+   * @remarks
+   * - Backed by `idx_saga_domain_status` — avoids a sequential scan on large tables.
+   * - Equivalent SQL: `SELECT * FROM saga WHERE domain = 'subscription' AND status = 'FAILED' ORDER BY failed_at ASC`
+   *
+   * @returns {Promise<SagaEntity[]>} Sagas awaiting manual reprocess, ordered by `failed_at ASC`.
    */
   async listPendingReprocess(): Promise<SagaEntity[]> {
     return this.sagaRepository.find({
@@ -32,31 +37,42 @@ export class SubscriptionReprocessService {
   }
 
   /**
-   * Republishes the failed step's original event back to the main
-   * exchange so the saga continues from where it died.
+   * Replays the failed step's original event back onto the main orchestrator exchange
+   * so the saga can continue from the exact point it died.
    *
-   * IMPORTANT: the downstream step handler MUST be idempotent. A
-   * "failure" here may mean the upstream call (e.g. payment charge)
-   * actually succeeded and only the saga's bookkeeping step failed —
-   * replaying it blindly could double-charge a customer.
+   * @remarks
+   * - **Idempotency requirement**: the downstream step handler MUST be idempotent before
+   *   invoking this method. A step "failure" may mean the upstream call (e.g. a payment
+   *   charge) actually succeeded but only the saga's bookkeeping step failed — replaying
+   *   blindly without idempotency guards could double-charge a customer.
+   * - After publishing, the saga is transitioned to `RUNNING` and its `reprocess_count`
+   *   and `last_reprocessed_at` fields are updated for audit purposes.
+   *
+   * @param {string} sagaId - UUID of the saga to reprocess.
+   * @returns {Promise<void>} Resolves once the event has been published and the saga row updated.
+   * @throws {Error} Throws if the saga domain is not `subscription`, the status is not `FAILED`,
+   *                 or the saga has no `failure_context` to replay.
    */
   async reprocess(sagaId: string): Promise<void> {
     const saga = await this.sagaRepository.findOneOrFail({
       where: { id: sagaId },
     });
 
+    /* Guard: only subscription-domain sagas flow through this pipeline */
     if (saga.domain !== SagaDomain.SUBSCRIPTION) {
       throw new Error(
-        `Saga ${sagaId} is domain="${saga.domain}", not "${SagaDomain.SUBSCRIPTION}" refusing to reprocess via this pipeline.`,
+        `Saga ${sagaId} is domain="${saga.domain}", not "${SagaDomain.SUBSCRIPTION}" — refusing to reprocess via this pipeline.`,
       );
     }
 
+    /* Guard: only FAILED sagas should be replayed */
     if (saga.status !== SagaStatus.FAILED) {
       throw new Error(
         `Saga ${sagaId} is not in FAILED state (current: ${saga.status}).`,
       );
     }
 
+    /* Guard: without failure_context we have nothing to replay */
     if (!saga.failure_context) {
       throw new Error(`Saga ${sagaId} has no failure_context to replay.`);
     }

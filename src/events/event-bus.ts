@@ -9,7 +9,7 @@ import { AppError, BAD_REQUEST } from '@core/main';
 import { logger } from '@platform/logger';
 import { SagaDomain } from '../enums/saga.domain.enum';
 import { OrchestratorEventType } from '../enums/orchestrator-event-type.enum';
-import { DLQ_QUEUE_NAMES } from '../constants/saga.constants';
+import { DLQ_QUEUE_NAMES, EVENTS } from '../constants/saga.constants';
 
 export class RabbitMQEventBus {
   private readonly ORCHESTRATOR_TYPE = 'direct';
@@ -70,6 +70,23 @@ export class RabbitMQEventBus {
       this.ORCHESTRATOR_EXCHANGE,
       this.ORCHESTRATOR_ROUTING_KEY,
     );
+
+    const stepReplyRoutingKeys = [
+      EVENTS.ORDER_ACCEPTED_V1,
+      EVENTS.ORDER_REJECTED_V1,
+      EVENTS.DISPATCH_CREATED_V1,
+      EVENTS.DISPATCH_CREATION_REJECTED_V1,
+      EVENTS.AGENT_NOTIFIED_V1,
+      EVENTS.AGENT_ASSIGNED_V1,
+    ];
+
+    for (const routingKey of stepReplyRoutingKeys) {
+      await this.channel.bindQueue(
+        this.ORCHESTRATOR_QUEUE,
+        this.ORCHESTRATOR_EXCHANGE,
+        routingKey,
+      );
+    }
 
     /* Setting up DLQs on bus initiation */
     await this.setupDLQTopology();
@@ -368,3 +385,4 @@ export class RabbitMQEventBus {
     }
   }
 }
+

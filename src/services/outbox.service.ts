@@ -4,6 +4,7 @@ import { OrchestratorOutboxRepository } from '../repositories/orchestrator-outbo
 import { DataSource } from 'typeorm';
 import { logger } from '@platform/logger';
 import pLimit from 'p-limit';
+import { context, trace, withSpan } from '@platform/tracing';
 
 export class OutboxService {
   private readonly MAX_RETRIES = 3;
@@ -41,12 +42,28 @@ export class OutboxService {
           recordId: record.id,
           routingKey: record.routing_key,
         });
-        return this.limit(() =>
-          this.eventBus.publishWithRoutingKey(
-            record.routing_key,
-            record.payload,
-          ),
-        );
+        return this.limit(() => {
+          return withSpan('Outbox Event Publish', () => {
+            const span = trace.getSpan(context.active());
+
+            span?.setAttribute('outbox.id', record.id);
+            span?.setAttribute('saga.id', record.saga_id);
+            span?.setAttribute(
+              'outbox.saga_event_type',
+              record.saga_event_type,
+            );
+            span?.setAttribute('outbox.domain', record.domain);
+            span?.setAttribute('outbox.retries', record.retries);
+            span?.setAttribute('messaging.routing_key', record.routing_key);
+
+            span?.addEvent('Publishing outbox event');
+
+            return this.eventBus.publishWithRoutingKey(
+              record.routing_key,
+              record.payload,
+            );
+          });
+        });
       }),
     );
 
@@ -71,13 +88,15 @@ export class OutboxService {
       await Promise.all(
         dlqEvents.map((event) =>
           this.limit(() =>
-            this.eventBus.publishToDLQ({
-              payload: event.payload,
-              saga_id: event.saga_id,
-              saga_event_type: event.saga_event_type,
-              routing_key: event.routing_key,
-              domain: event.domain,
-            }),
+            withSpan('outbox-event-dlq-publish', () =>
+              this.eventBus.publishToDLQ({
+                payload: event.payload,
+                saga_id: event.saga_id,
+                saga_event_type: event.saga_event_type,
+                routing_key: event.routing_key,
+                domain: event.domain,
+              }),
+            ),
           ),
         ),
       );

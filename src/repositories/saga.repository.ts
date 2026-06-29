@@ -67,6 +67,27 @@ export class SagaRepository {
   }
 
   /**
+   * Finds a SagaEntity by its business correlation ID.
+   *
+   * @param {string} correlation_id - Business key used to correlate replies, for example order ID.
+   * @returns {Promise<SagaEntity | null>} A promise resolving to the matching SagaEntity, or null if not found.
+   */
+  async findByCorrelationId(
+    correlation_id: string,
+  ): Promise<SagaEntity | null> {
+    return this.sagaRepo.findOne({
+      where: { correlation_id },
+      select: {
+        id: true,
+        current_step_index: true,
+        status: true,
+        completed_steps: true,
+        payload: true,
+      },
+    });
+  }
+
+  /**
    * Finds SagaEntity records matching the given TypeORM find options.
    *
    * @param {FindManyOptions<SagaEntity>} options - TypeORM find options.
@@ -102,3 +123,4 @@ export class SagaRepository {
     return this.sagaRepo.update({ id }, payload);
   }
 }
+

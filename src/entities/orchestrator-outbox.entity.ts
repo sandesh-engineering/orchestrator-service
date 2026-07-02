@@ -54,6 +54,9 @@ export class OrchestratorOutbox {
   @Column({ type: 'timestamp', nullable: true })
   failed_at!: Date | null;
 
+  @Column({ type: 'jsonb', nullable: true })
+  metadata!: Record<string, unknown>;
+
   @CreateDateColumn()
   created_at!: Date;
 

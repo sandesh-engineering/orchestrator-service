@@ -2,6 +2,8 @@ import 'dotenv/config';
 import { ConnectionManager, RabbitMQService } from '@platform/queue-rabbitmq';
 import { logger } from '@platform/logger';
 import { EVENTS } from '../constants/saga.constants';
+import { context, getTracer, trace, withSpan } from '@platform/tracing';
+import { ContextPropagation } from 'src/tracing/propagation/context';
 
 /* ─── CONFIG ──────────────────────────────────────────────────── */
 const PAYMENT_EXCHANGE = 'payment.exchange';
@@ -99,40 +101,42 @@ const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 async function runHappyPath(svc: RabbitMQService): Promise<void> {
   logger.info('═══ SCENARIO: Happy Path — full dispatch saga ═══');
 
-  for (const order of MOCK_ORDERS) {
-    logger.info('Publishing payment.v1.order.succeeded', {
-      order_id: order.order_id,
-      payment_reference: order.payment_reference,
-    });
-
-    await svc.publish(PAYMENT_EXCHANGE, PAYMENT_ROUTING_KEY, order, {
-      persistent: true,
-    });
-
-    /* Wait briefly so the orchestrator can start the saga before we reply */
-    await sleep(1_500);
-
-    /* Walk through the 4-step dispatch saga */
-    for (const reply of MOCK_STEP_REPLIES) {
-      logger.info(`Publishing step reply: ${reply.label}`, {
+  await withSpan('Mock Order Placement', async () => {
+    for (const order of MOCK_ORDERS) {
+      logger.info('Publishing payment.v1.order.succeeded', {
         order_id: order.order_id,
-        routingKey: reply.routingKey,
+        payment_reference: order.payment_reference,
       });
 
-      await svc.publish(
-        ORCHESTRATOR_EXCHANGE,
-        reply.routingKey,
-        reply.payload(order.order_id),
-        { persistent: true },
-      );
+      await svc.publish(PAYMENT_EXCHANGE, PAYMENT_ROUTING_KEY, order, {
+        persistent: true,
+      });
 
-      await sleep(1_000);
+      /* Wait briefly so the orchestrator can start the saga before we reply */
+      await sleep(1_500);
+
+      /* Walk through the 4-step dispatch saga */
+      for (const reply of MOCK_STEP_REPLIES) {
+        logger.info(`Publishing step reply: ${reply.label}`, {
+          order_id: order.order_id,
+          routingKey: reply.routingKey,
+        });
+
+        await svc.publish(
+          ORCHESTRATOR_EXCHANGE,
+          reply.routingKey,
+          reply.payload(order.order_id),
+          { persistent: true },
+        );
+
+        await sleep(1_000);
+      }
+
+      logger.info('Happy-path walk complete for order', {
+        order_id: order.order_id,
+      });
     }
-
-    logger.info('Happy-path walk complete for order', {
-      order_id: order.order_id,
-    });
-  }
+  });
 }
 
 /**

@@ -11,6 +11,7 @@ import { RabbitMQEventBus } from './events/event-bus';
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
 import { SagaRepository } from './repositories/saga.repository';
 import { SagaStateDefinition } from './types/saga.types';
+import { ContextPropagation } from './tracing/propagation/context';
 
 export interface StepSuccessPayload {
   type: 'STEP_SUCCESS';
@@ -190,10 +191,13 @@ export class SagaCoordinator {
       sagaRecord.status !== SagaStatus.PENDING &&
       sagaRecord.status !== SagaStatus.RUNNING
     ) {
-      logger.warn('Saga status is not PENDING or RUNNING, ignoring success event', {
-        sagaId: payload.saga_id,
-        status: sagaRecord.status,
-      });
+      logger.warn(
+        'Saga status is not PENDING or RUNNING, ignoring success event',
+        {
+          sagaId: payload.saga_id,
+          status: sagaRecord.status,
+        },
+      );
       return;
     }
 
@@ -392,22 +396,34 @@ export class SagaCoordinator {
     const commandPayload = { ...payload, event_id: eventId, saga_id: sagaId };
 
     if (!skipTransaction && manager) {
+      /* Extract the current context of trace */
+      const carrier = ContextPropagation.createCarrier();
+
       const commandInstance = manager.create(OrchestratorOutbox, {
         saga_id: sagaId,
         event_id: eventId,
         routing_key: routingKey,
         payload: commandPayload,
         saga_event_type: OrchestratorEventType.COMMAND,
+        metadata: {
+          trace: carrier,
+        },
       });
 
       await manager.save(OrchestratorOutbox, commandInstance);
     } else {
+      /* Extract the current context of trace */
+      const carrier = ContextPropagation.createCarrier();
+
       await this.sagaOutboxRepository.createAndSaveOutboxRecord({
         saga_id: sagaId,
         event_id: eventId,
         routing_key: routingKey,
         payload: commandPayload,
         saga_event_type: OrchestratorEventType.COMMAND,
+        metadata: {
+          trace: carrier,
+        },
       });
     }
   }
@@ -428,7 +444,9 @@ export class SagaCoordinator {
   private async toSagaStepPayload(
     message: ConsumeMessage,
   ): Promise<StepSuccessPayload | StepFailurePayload | null> {
-    const raw = JSON.parse(message.content.toString()) as DomainStepReplyPayload;
+    const raw = JSON.parse(
+      message.content.toString(),
+    ) as DomainStepReplyPayload;
     const routingKey = message.fields.routingKey;
     const explicitType = raw.type;
 

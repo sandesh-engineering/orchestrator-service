@@ -2,6 +2,8 @@ import { ConsumeMessage } from '@platform/queue-rabbitmq';
 import { logger } from '@platform/logger';
 import { SagaCoordinator } from '../saga-coordinator';
 import { OrchestratorDlqMessage } from '../types/saga.types';
+import { withSpan } from '@platform/tracing';
+import { ContextPropagation } from 'src/tracing/propagation/context';
 
 /**
  * Typed shape of the event published by the payment service on `payment.v1.order.succeeded`.
@@ -37,50 +39,63 @@ export class OrchestratorListener {
     /* Guard: broker sends null when the consumer is cancelled */
     if (!message) return;
 
-    const raw = JSON.parse(
-      message.content.toString(),
-    ) as PaymentOrderSucceededEvent;
-
-    logger.info('Received payment.v1.order.succeeded, evaluating saga start', {
-      order_id: raw.order_id,
-      payment_reference: raw.payment_reference,
-    });
-
-    /* Edge case: malformed event missing the business key */
-    if (!raw.order_id) {
-      logger.warn('Ignoring payment event — missing order_id', { raw });
-      return;
-    }
-
-    const idempotencyKey = `dispatch-saga:order:${raw.order_id}`;
-
-    const { isNew, sagaId } = await this.coordinator.startSaga(
-      idempotencyKey,
-      raw.order_id,
-      raw as unknown as Record<string, unknown>,
+    const context = ContextPropagation.extractContext(
+      message?.properties?.headers?.trace ?? {},
     );
 
-    if (!isNew || !sagaId) {
-      logger.warn('Saga already running or completed for order, skipping', {
-        order_id: raw.order_id,
-        sagaId,
-        idempotencyKey,
-      });
-      return;
-    }
+    await withSpan(
+      'Dispatch Saga Start',
+      async () => {
+        const raw = JSON.parse(
+          message.content.toString(),
+        ) as PaymentOrderSucceededEvent;
 
-    logger.info('Saga started for order, dispatching first step', {
-      order_id: raw.order_id,
-      sagaId,
-    });
+        logger.info(
+          'Received payment.v1.order.succeeded, evaluating saga start',
+          {
+            order_id: raw.order_id,
+            payment_reference: raw.payment_reference,
+          },
+        );
 
-    /* Dispatch step 0 immediately — avoids waiting for the next outbox poll cycle */
-    await this.coordinator.dispatchNextStep({
-      payload: raw as unknown as Record<string, unknown>,
-      sagaId,
-      skipTransaction: true,
-      stepIndex: 0,
-    });
+        /* Edge case: malformed event missing the business key */
+        if (!raw.order_id) {
+          logger.warn('Ignoring payment event — missing order_id', { raw });
+          return;
+        }
+
+        const idempotencyKey = `dispatch-saga:order:${raw.order_id}`;
+
+        const { isNew, sagaId } = await this.coordinator.startSaga(
+          idempotencyKey,
+          raw.order_id,
+          raw as unknown as Record<string, unknown>,
+        );
+
+        if (!isNew || !sagaId) {
+          logger.warn('Saga already running or completed for order, skipping', {
+            order_id: raw.order_id,
+            sagaId,
+            idempotencyKey,
+          });
+          return;
+        }
+
+        logger.info('Saga started for order, dispatching first step', {
+          order_id: raw.order_id,
+          sagaId,
+        });
+
+        /* Dispatch step 0 immediately — avoids waiting for the next outbox poll cycle */
+        await this.coordinator.dispatchNextStep({
+          payload: raw as unknown as Record<string, unknown>,
+          sagaId,
+          skipTransaction: true,
+          stepIndex: 0,
+        });
+      },
+      context,
+    );
   };
 
   /**

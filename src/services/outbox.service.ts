@@ -6,6 +6,7 @@ import { logger } from '@platform/logger';
 import pLimit from 'p-limit';
 import { context, trace, withSpan } from '@platform/tracing';
 import { OutboxTracingAttributes } from 'src/tracing/attributes/outbox.attributes';
+import { ContextPropagation } from 'src/tracing/propagation/context';
 
 export class OutboxService {
   private readonly MAX_RETRIES = 3;
@@ -58,25 +59,34 @@ export class OutboxService {
       /* Publishing the events */
       const results = await Promise.allSettled(
         records.map((record) => {
+          const parentContext = ContextPropagation.extractContext(
+            //@ts-ignore
+            record.metadata?.trace ?? {},
+          );
+
           logger.debug('Publishing outbox record to event bus', {
             recordId: record.id,
             routingKey: record.routing_key,
           });
           return this.limit(() => {
-            return withSpan('Publish Outbox Event', () => {
-              const span = trace.getSpan(context.active());
+            return withSpan(
+              'Publish Outbox Event',
+              () => {
+                const span = trace.getSpan(context.active());
 
-              /* Setting the necessary trace attributes for publish child span */
-              OutboxTracingAttributes.setPublishOutboxEventAttributes(
-                span,
-                record as unknown as Record<string, string | number>,
-              );
+                /* Setting the necessary trace attributes for publish child span */
+                OutboxTracingAttributes.setPublishOutboxEventAttributes(
+                  span,
+                  record as unknown as Record<string, string | number>,
+                );
 
-              return this.eventBus.publishWithRoutingKey(
-                record.routing_key,
-                record.payload,
-              );
-            });
+                return this.eventBus.publishWithRoutingKey(
+                  record.routing_key,
+                  record.payload,
+                );
+              },
+              parentContext,
+            );
           });
         }),
       );
@@ -109,33 +119,36 @@ export class OutboxService {
           dlqIds,
         });
         await Promise.all(
-          dlqEvents.map((event) =>
+          dlqEvents.map((event) => {
+            const parentContext = ContextPropagation.extractContext(
+              //@ts-ignore
+              event.metadata?.trace ?? {},
+            );
+
             this.limit(() =>
-              withSpan('Publish DLQ Event', () => {
-                const span = trace.getSpan(context.active());
+              withSpan(
+                'Publish DLQ Event',
+                () => {
+                  const span = trace.getSpan(context.active());
 
-                span?.setAttribute('outbox.id', event.id);
-                span?.setAttribute('saga.id', event.saga_id);
-                span?.setAttribute('outbox.domain', event.domain);
-                span?.setAttribute('outbox.retries', event.retries);
-                span?.setAttribute('messaging.routing_key', event.routing_key);
+                  /* Trace attributes for DLQ events */
+                  OutboxTracingAttributes.setDlqOutboxEventAttributes(
+                    span,
+                    event as unknown as Record<string, string | number>,
+                  );
 
-                /* Trace attributes for DLQ events */
-                OutboxTracingAttributes.setDlqOutboxEventAttributes(
-                  span,
-                  event as unknown as Record<string, string | number>,
-                );
-
-                return this.eventBus.publishToDLQ({
-                  payload: event.payload,
-                  saga_id: event.saga_id,
-                  saga_event_type: event.saga_event_type,
-                  routing_key: event.routing_key,
-                  domain: event.domain,
-                });
-              }),
-            ),
-          ),
+                  return this.eventBus.publishToDLQ({
+                    payload: event.payload,
+                    saga_id: event.saga_id,
+                    saga_event_type: event.saga_event_type,
+                    routing_key: event.routing_key,
+                    domain: event.domain,
+                  });
+                },
+                parentContext,
+              ),
+            );
+          }),
         );
       }
 

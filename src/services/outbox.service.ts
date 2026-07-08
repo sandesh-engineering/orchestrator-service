@@ -26,173 +26,169 @@ export class OutboxService {
    */
   async poll(): Promise<void> {
     await withSpan('Outbox Events In Batch', async () => {
-      const span = trace.getSpan(context.active());
+    const span = trace.getSpan(context.active());
 
-      /* Setting the initial batch attributes for trace */
-      OutboxTracingAttributes.setInitialBatchAttributes(span);
+    /* Setting the initial batch attributes for trace */
+    OutboxTracingAttributes.setInitialBatchAttributes(span);
 
-      logger.debug('Polling orchestrator outbox for unprocessed events');
+    logger.debug('Polling orchestrator outbox for unprocessed events');
 
-      /* Getting the unprocessed records */
-      const records =
-        await this.outboxRepository.fetchUnprocessedEventsInBatch(1000);
+    /* Getting the unprocessed records */
+    const records =
+      await this.outboxRepository.fetchUnprocessedEventsInBatch(1000);
 
-      /* Adding event trace for more info */
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Fetched unprocessed events',
-      );
+    /* Adding event trace for more info */
+    OutboxTracingAttributes.setOutboxEventTrace(
+      span,
+      'Fetched unprocessed events',
+    );
 
-      if (records.length === 0) {
-        return;
-      }
+    if (records.length === 0) {
+      return;
+    }
 
-      logger.info('Fetched unprocessed outbox events', {
-        count: records.length,
+    logger.info('Fetched unprocessed outbox events', {
+      count: records.length,
+    });
+
+    OutboxTracingAttributes.setOutboxEventTrace(
+      span,
+      'Publishing outbox event',
+    );
+
+    /* Publishing the events */
+    const results = await Promise.allSettled(
+      records.map((record) => {
+        const parentContext = ContextPropagation.extractContext(
+          //@ts-ignore
+          record.metadata?.trace ?? {},
+        );
+
+        logger.debug('Publishing outbox record to event bus', {
+          recordId: record.id,
+          routingKey: record.routing_key,
+        });
+        return this.limit(() => {
+          return withSpan(
+            'Publish Outbox Event',
+            () => {
+              const span = trace.getSpan(context.active());
+
+              /* Setting the necessary trace attributes for publish child span */
+              OutboxTracingAttributes.setPublishOutboxEventAttributes(
+                span,
+                record as unknown as Record<string, string | number>,
+              );
+
+              return this.eventBus.publishWithRoutingKey(
+                record.routing_key,
+                record.payload,
+              );
+            },
+            parentContext,
+          );
+        });
+      }),
+    );
+
+    OutboxTracingAttributes.setOutboxEventTrace(
+      span,
+      'Classifying obtained results',
+    );
+    /* Separating the event ids based on their success and failure rates such that we can reroute them later */
+    const { dlqIds, failedIds, successIds } = this.setEventIdsInRelevantDomain({
+      records,
+      results,
+    });
+
+    /* Events that are failed such that they shall be sent to DLQ */
+    const dlqEvents =
+      dlqIds.length > 0
+        ? await this.outboxRepository.findEventsByIds(dlqIds)
+        : [];
+
+    OutboxTracingAttributes.setOutboxEventTrace(span, 'Publishing dlq events');
+    /* Publishing the events to DLQ */
+    if (dlqEvents.length > 0) {
+      logger.warn('Publishing failed events to DLQ exchange', {
+        count: dlqEvents.length,
+        dlqIds,
       });
-
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Publishing outbox event',
-      );
-
-      /* Publishing the events */
-      const results = await Promise.allSettled(
-        records.map((record) => {
+      await Promise.all(
+        dlqEvents.map((event) => {
           const parentContext = ContextPropagation.extractContext(
             //@ts-ignore
-            record.metadata?.trace ?? {},
+            event.metadata?.trace ?? {}
           );
 
-          logger.debug('Publishing outbox record to event bus', {
-            recordId: record.id,
-            routingKey: record.routing_key,
-          });
-          return this.limit(() => {
-            return withSpan(
-              'Publish Outbox Event',
+          this.limit(() =>
+            withSpan(
+              'Publish DLQ Event',
               () => {
                 const span = trace.getSpan(context.active());
 
-                /* Setting the necessary trace attributes for publish child span */
-                OutboxTracingAttributes.setPublishOutboxEventAttributes(
+                /* Trace attributes for DLQ events */
+                OutboxTracingAttributes.setDlqOutboxEventAttributes(
                   span,
-                  record as unknown as Record<string, string | number>,
+                  event as unknown as Record<string, string | number>,
                 );
 
-                return this.eventBus.publishWithRoutingKey(
-                  record.routing_key,
-                  record.payload,
-                );
+                return this.eventBus.publishToDLQ({
+                  payload: event.payload,
+                  saga_id: event.saga_id,
+                  saga_event_type: event.saga_event_type,
+                  routing_key: event.routing_key,
+                  domain: event.domain,
+                });
               },
               parentContext,
-            );
-          });
+            ),
+          );
         }),
       );
+    }
 
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Classifying obtained results',
+    OutboxTracingAttributes.setOutboxEventTrace(
+      span,
+      'Updating statuses of processed and failed records',
+    );
+
+    /* Updating the statuses */
+    await this.datasource.transaction(async (manager) => {
+      logger.debug(
+        'Updating statuses of processed and failed records in transaction',
+        {
+          successIdsCount: successIds.length,
+          dlqIdsCount: dlqIds.length,
+          failedIdsCount: failedIds.length,
+        },
       );
-      /* Separating the event ids based on their success and failure rates such that we can reroute them later */
-      const { dlqIds, failedIds, successIds } =
-        this.setEventIdsInRelevantDomain({
-          records,
-          results,
-        });
 
-      /* Events that are failed such that they shall be sent to DLQ */
-      const dlqEvents =
-        dlqIds.length > 0
-          ? await this.outboxRepository.findEventsByIds(dlqIds)
-          : [];
-
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Publishing dlq events',
-      );
-      /* Publishing the events to DLQ */
-      if (dlqEvents.length > 0) {
-        logger.warn('Publishing failed events to DLQ exchange', {
-          count: dlqEvents.length,
-          dlqIds,
-        });
-        await Promise.all(
-          dlqEvents.map((event) => {
-            const parentContext = ContextPropagation.extractContext(
-              //@ts-ignore
-              event.metadata?.trace ?? {},
-            );
-
-            this.limit(() =>
-              withSpan(
-                'Publish DLQ Event',
-                () => {
-                  const span = trace.getSpan(context.active());
-
-                  /* Trace attributes for DLQ events */
-                  OutboxTracingAttributes.setDlqOutboxEventAttributes(
-                    span,
-                    event as unknown as Record<string, string | number>,
-                  );
-
-                  return this.eventBus.publishToDLQ({
-                    payload: event.payload,
-                    saga_id: event.saga_id,
-                    saga_event_type: event.saga_event_type,
-                    routing_key: event.routing_key,
-                    domain: event.domain,
-                  });
-                },
-                parentContext,
-              ),
-            );
-          }),
-        );
+      if (successIds.length > 0) {
+        await this.outboxRepository.markProcessed(successIds, manager);
       }
 
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Updating statuses of processed and failed records',
-      );
+      if (dlqIds.length > 0) {
+        await this.outboxRepository.markDeadLettered(dlqIds, manager);
+      }
 
-      /* Updating the statuses */
-      await this.datasource.transaction(async (manager) => {
-        logger.debug(
-          'Updating statuses of processed and failed records in transaction',
-          {
-            successIdsCount: successIds.length,
-            dlqIdsCount: dlqIds.length,
-            failedIdsCount: failedIds.length,
-          },
-        );
+      if (failedIds.length > 0) {
+        await this.outboxRepository.incrementRetries(failedIds, manager);
+      }
+    });
 
-        if (successIds.length > 0) {
-          await this.outboxRepository.markProcessed(successIds, manager);
-        }
+    /* Additional info for parent trace */
+    OutboxTracingAttributes.setFinalBatchAttributes(span, {
+      successIdsLength: successIds.length,
+      failedIdsLength: failedIds.length,
+      dlqIdsLength: dlqEvents.length,
+    });
+    OutboxTracingAttributes.setOutboxEventTrace(
+      span,
+      'Finished batch processing',
+    );
 
-        if (dlqIds.length > 0) {
-          await this.outboxRepository.markDeadLettered(dlqIds, manager);
-        }
-
-        if (failedIds.length > 0) {
-          await this.outboxRepository.incrementRetries(failedIds, manager);
-        }
-      });
-
-      /* Additional info for parent trace */
-      OutboxTracingAttributes.setFinalBatchAttributes(span, {
-        successIdsLength: successIds.length,
-        failedIdsLength: failedIds.length,
-        dlqIdsLength: dlqEvents.length,
-      });
-      OutboxTracingAttributes.setOutboxEventTrace(
-        span,
-        'Finished batch processing',
-      );
-
-      logger.debug('Polling batch processing finished successfully');
+    logger.debug('Polling batch processing finished successfully');
     });
   }
 

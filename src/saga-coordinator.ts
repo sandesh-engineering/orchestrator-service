@@ -12,6 +12,7 @@ import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox
 import { SagaRepository } from './repositories/saga.repository';
 import { SagaStateDefinition } from './types/saga.types';
 import { ContextPropagation } from './tracing/propagation/context';
+import { context, trace, withSpan } from '@platform/tracing';
 
 export interface StepSuccessPayload {
   type: 'STEP_SUCCESS';
@@ -83,6 +84,13 @@ export class SagaCoordinator {
         routingKey: message.fields.routingKey,
       });
 
+      /* Extract the trace context written by publishWithRoutingKey into the
+         AMQP headers so that step-reply spans are children of the original
+         saga dispatch trace rather than new disconnected root traces. */
+      const parentContext = ContextPropagation.extractContext(
+        message.properties?.headers?.trace ?? {},
+      );
+
       const payload = await this.toSagaStepPayload(message);
       if (!payload) return;
 
@@ -94,9 +102,17 @@ export class SagaCoordinator {
 
       try {
         if (payload.type === 'STEP_SUCCESS') {
-          await this.onStepSuccess(payload);
+          await withSpan(
+            'Saga Step Success',
+            () => this.onStepSuccess(payload),
+            parentContext,
+          );
         } else if (payload.type === 'STEP_FAILURE') {
-          await this.onStepFailure(payload);
+          await withSpan(
+            'Saga Step Failure',
+            () => this.onStepFailure(payload),
+            parentContext,
+          );
         }
       } catch (err: unknown) {
         logger.error('Unhandled error in saga message handler', {
@@ -124,45 +140,60 @@ export class SagaCoordinator {
     correlation_id: string,
     payload?: Record<string, unknown>,
   ): Promise<{ sagaId: string | undefined; isNew: boolean }> {
-    logger.info('Starting new Saga workflow', {
-      sagaName: this.name,
-      idempotency_key,
-      correlation_id,
-    });
-
-    const result = await this.datasource.transaction(async (manager) => {
-      await manager
-        .createQueryBuilder()
-        .insert()
-        .into(SagaEntity)
-        .values({
-          name: this.name,
-          idempotency_key,
-          correlation_id,
-          // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
-          payload: payload ?? {},
-          current_step_index: 0,
-          status: SagaStatus.PENDING,
-          started_at: new Date().toISOString(),
-        })
-        .orIgnore()
-        .execute();
-
-      return manager.findOne(SagaEntity, {
-        where: { idempotency_key },
+    return withSpan('Start Saga', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttributes({
+        'saga.name': this.name,
+        'saga.idempotency_key': idempotency_key,
+        'saga.correlation_id': correlation_id,
       });
+
+      logger.info('Starting new Saga workflow', {
+        sagaName: this.name,
+        idempotency_key,
+        correlation_id,
+      });
+
+      const result = await this.datasource.transaction(async (manager) => {
+        await manager
+          .createQueryBuilder()
+          .insert()
+          .into(SagaEntity)
+          .values({
+            name: this.name,
+            idempotency_key,
+            correlation_id,
+            // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
+            payload: payload ?? {},
+            current_step_index: 0,
+            status: SagaStatus.PENDING,
+            started_at: new Date().toISOString(),
+          })
+          .orIgnore()
+          .execute();
+
+        return manager.findOne(SagaEntity, {
+          where: { idempotency_key },
+        });
+      });
+
+      const isNew =
+        result?.status === SagaStatus.PENDING && result?.current_step_index === 0;
+
+      span?.setAttributes({
+        'saga.id': result?.id,
+        'saga.is_new': isNew,
+        'saga.status': result?.status,
+      });
+
+      logger.info('Saga start resolved', {
+        sagaId: result?.id,
+        isNew,
+        status: result?.status,
+      });
+
+      return { sagaId: result?.id, isNew };
     });
-
-    const isNew =
-      result?.status === SagaStatus.PENDING && result?.current_step_index === 0;
-
-    logger.info('Saga start resolved', {
-      sagaId: result?.id,
-      isNew,
-      status: result?.status,
-    });
-
-    return { sagaId: result?.id, isNew };
   }
 
   /**
@@ -173,6 +204,12 @@ export class SagaCoordinator {
    * @throws {AppError} If the update fails (already processed).
    */
   private async onStepSuccess(payload: StepSuccessPayload): Promise<void> {
+    const span = trace.getSpan(context.active());
+    span?.setAttributes({
+      'saga.id': payload.saga_id,
+      'saga.event_id': payload.event_id,
+    });
+
     logger.info('Handling step success event', {
       sagaId: payload.saga_id,
       eventId: payload.event_id,
@@ -268,6 +305,12 @@ export class SagaCoordinator {
    * @returns {Promise<void>} A promise resolving when compensation processing completes.
    */
   private async onStepFailure(payload: StepFailurePayload): Promise<void> {
+    const span = trace.getSpan(context.active());
+    span?.setAttributes({
+      'saga.id': payload.saga_id,
+      'saga.event_id': payload.event_id,
+    });
+
     logger.warn('Handling step failure event', {
       sagaId: payload.saga_id,
       eventId: payload.event_id,
@@ -396,6 +439,10 @@ export class SagaCoordinator {
     const commandPayload = { ...payload, event_id: eventId, saga_id: sagaId };
 
     if (!skipTransaction && manager) {
+      console.log(
+        'active span:',
+        trace.getSpan(context.active())?.spanContext(),
+      );
       /* Extract the current context of trace */
       const carrier = ContextPropagation.createCarrier();
 
@@ -413,6 +460,10 @@ export class SagaCoordinator {
       await manager.save(OrchestratorOutbox, commandInstance);
     } else {
       /* Extract the current context of trace */
+      console.log(
+        'active span:',
+        trace.getSpan(context.active())?.spanContext(),
+      );
       const carrier = ContextPropagation.createCarrier();
 
       await this.sagaOutboxRepository.createAndSaveOutboxRecord({
@@ -536,25 +587,33 @@ export class SagaCoordinator {
       return;
     }
 
-    const updateMetadata = await this.sagaRepository.update({
-      whereClause: { id: saga_id, status: Not(SagaStatus.FAILED) },
-      payload: {
-        status: SagaStatus.FAILED,
-        failure_context,
-        failed_at: () => 'NOW()',
-      },
+    await withSpan('Mark Saga As Failed', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttributes({
+        'saga.id': saga_id,
+        'saga.routing_key': failure_context.routing_key,
+      });
+
+      const updateMetadata = await this.sagaRepository.update({
+        whereClause: { id: saga_id, status: Not(SagaStatus.FAILED) },
+        payload: {
+          status: SagaStatus.FAILED,
+          failure_context,
+          failed_at: () => 'NOW()',
+        },
+      });
+
+      if (updateMetadata.affected === 0) {
+        logger.error('Saga already marked as failed', { sagaId: saga_id });
+        throw new AppError(
+          false,
+          'Saga already marked as failed!',
+          BAD_REQUEST,
+          true,
+        );
+      }
+
+      logger.info('Saga marked as failed!', { sagaId: saga_id });
     });
-
-    if (updateMetadata.affected === 0) {
-      logger.error('Saga already marked as failed', { sagaId: saga_id });
-      throw new AppError(
-        false,
-        'Saga already marked as failed!',
-        BAD_REQUEST,
-        true,
-      );
-    }
-
-    logger.info('Saga marked as failed!', { sagaId: saga_id });
   }
 }

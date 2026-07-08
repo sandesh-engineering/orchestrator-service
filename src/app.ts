@@ -1,6 +1,19 @@
+import { createTracing } from '@platform/tracing';
+
+const sdk = createTracing({
+  serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
+  serviceVersion: '1.0.0',
+  collectorUrl:
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4317',
+  samplingRatio: process.env.NODE_ENV === 'development' ? 1 : 0.3,
+});
+
+console.log(sdk, 'Tacer SDK');
+
+sdk.start();
+
 import express, { Application } from 'express';
 import { logger } from '@platform/logger';
-import { createTracing } from '@platform/tracing';
 
 import { RabbitMQEventBus } from './events/event-bus';
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
@@ -12,16 +25,6 @@ import { SagaRepository } from './repositories/saga.repository';
 import { OrchestratorListener } from './events/listeners';
 
 export const app: Application = express();
-
-const sdk = createTracing({
-  serviceName: process.env.SERVICE_NAME ?? 'workflow-orchestrator',
-  serviceVersion: '1.0.0',
-  collectorUrl:
-    process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4317',
-  samplingRatio: 0.3,
-});
-
-sdk.start();
 
 /* APPLICATION LEVEL CLASSES */
 export const eventBus = new RabbitMQEventBus();

@@ -162,6 +162,7 @@ function createOutboxRecord(
     domain: SagaDomain.DISPATCH,
     saga_event_type: OrchestratorEventType.COMMAND,
     payload: { order_id: 'order-1' },
+    metadata: { trace: { traceparent: '00-abc123-def456-01' } },
     retries: 0,
     processed: false,
     processed_at: null,

@@ -10,6 +10,7 @@ import { logger } from '@platform/logger';
 import { SagaDomain } from '../enums/saga.domain.enum';
 import { OrchestratorEventType } from '../enums/orchestrator-event-type.enum';
 import { DLQ_QUEUE_NAMES, EVENTS } from '../constants/saga.constants';
+import { ContextPropagation } from 'src/tracing/propagation/context';
 
 export class RabbitMQEventBus {
   private readonly ORCHESTRATOR_TYPE = 'direct';
@@ -201,11 +202,13 @@ export class RabbitMQEventBus {
         true,
       );
 
+    const carrier = ContextPropagation.createCarrier();
+
     const ok = this.channel.publish(
       this.ORCHESTRATOR_EXCHANGE,
       routingKey,
       Buffer.from(JSON.stringify(payload)),
-      { mandatory: true, persistent: true },
+      { mandatory: true, persistent: true, headers: { trace: carrier } },
     );
 
     if (!ok) {
@@ -287,10 +290,13 @@ export class RabbitMQEventBus {
         await callback(msg);
         channel.ack(msg);
       } catch (err) {
-        logger.error('Failed to process queued message — nacking without requeue', {
-          queue: queueName ?? this.ORCHESTRATOR_QUEUE,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        logger.error(
+          'Failed to process queued message — nacking without requeue',
+          {
+            queue: queueName ?? this.ORCHESTRATOR_QUEUE,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
         channel.nack(msg, false, false);
       }
     });
@@ -351,9 +357,12 @@ export class RabbitMQEventBus {
         await callback(msg);
         channel.ack(msg);
       } catch (err) {
-        logger.error('Failed to process payment event — nacking without requeue', {
-          error: err instanceof Error ? err.message : String(err),
-        });
+        logger.error(
+          'Failed to process payment event — nacking without requeue',
+          {
+            error: err instanceof Error ? err.message : String(err),
+          },
+        );
         channel.nack(msg, false, false);
       }
     });
@@ -385,4 +394,3 @@ export class RabbitMQEventBus {
     }
   }
 }
-

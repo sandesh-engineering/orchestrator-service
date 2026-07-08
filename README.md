@@ -122,7 +122,16 @@ COMPLETED
 - RabbitMQ
 - Docker
 - GitHub Actions
-- AWS (ECR + EC2) (Planned)
+- AWS EC2 (Docker Hub)
+
+---
+
+## CI/CD and Deployment
+
+The service features automated CI/CD pipelines defined under `.github/workflows/`:
+
+- **Continuous Integration**: Runs quality checks, linting, and builds the service.
+- **Continuous Deployment**: Deploys the service directly to AWS EC2. The pipeline builds the production Docker image, pushes it to Docker Hub, copies the production Docker Compose configurations and environment configurations to the EC2 host via secure SSH/SCP, starts the service, and validates its health via the health check endpoint.
 
 ---
 
@@ -137,19 +146,18 @@ Implemented:
 - Dead Letter Queue Support
 - Idempotent Processing
 - State-Driven Workflow Execution
+- Distributed Tracing & Context Propagation
+- Deployment Automation (GitHub Actions + AWS EC2)
 
 In Progress:
 
-- Distributed Tracing
-- Subscription Saga
-- Deployment Automation
 
 Planned:
 
 - RabbitMQ ACLs
-- OpenTelemetry
 - Workflow Versioning
 - ECS Deployment
+- Subscription Saga
 
 ---
 

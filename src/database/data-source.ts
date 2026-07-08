@@ -16,13 +16,13 @@ export const datasource = new DataSource({
   entities: [
     isTs
       ? join(__dirname, '../entities/**/*.entity.ts')
-      : join(__dirname, '../entities/**/*.entity.js')
+      : join(__dirname, '../entities/**/*.entity.js'),
   ],
   migrations: [
     isTs
       ? join(__dirname, './migrations/*.ts')
-      : join(__dirname, './migrations/*.js')
+      : join(__dirname, './migrations/*.js'),
   ],
   synchronize: false,
-  logging: process.env.NODE_ENV === "development" ? true : false,
+  logging: process.env.NODE_ENV !== 'development' ? true : false,
 });

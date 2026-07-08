@@ -2,6 +2,7 @@ import { SagaEntity, SagaStatus } from '../entities/saga.entity';
 import { SagaDomain } from '../enums/saga.domain.enum';
 import { RabbitMQEventBus } from '../events/event-bus';
 import { SagaRepository } from '../repositories/saga.repository';
+import { context, trace, withSpan } from '@platform/tracing';
 
 /**
  * Powers both the admin "subscription failures awaiting reprocess" view and
@@ -30,9 +31,18 @@ export class SubscriptionReprocessService {
    * @returns {Promise<SagaEntity[]>} Sagas awaiting manual reprocess, ordered by `failed_at ASC`.
    */
   async listPendingReprocess(): Promise<SagaEntity[]> {
-    return this.sagaRepository.find({
-      where: { domain: SagaDomain.SUBSCRIPTION, status: SagaStatus.FAILED },
-      order: { failed_at: 'ASC' },
+    return withSpan('List Pending Reprocess', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttribute('saga.domain', SagaDomain.SUBSCRIPTION);
+      span?.setAttribute('saga.status', SagaStatus.FAILED);
+
+      const sagas = await this.sagaRepository.find({
+        where: { domain: SagaDomain.SUBSCRIPTION, status: SagaStatus.FAILED },
+        order: { failed_at: 'ASC' },
+      });
+
+      span?.setAttribute('saga.count', sagas.length);
+      return sagas;
     });
   }
 
@@ -54,38 +64,50 @@ export class SubscriptionReprocessService {
    *                 or the saga has no `failure_context` to replay.
    */
   async reprocess(sagaId: string): Promise<void> {
-    const saga = await this.sagaRepository.findOneOrFail({
-      where: { id: sagaId },
-    });
+    await withSpan('Reprocess Saga', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttribute('saga.id', sagaId);
 
-    /* Guard: only subscription-domain sagas flow through this pipeline */
-    if (saga.domain !== SagaDomain.SUBSCRIPTION) {
-      throw new Error(
-        `Saga ${sagaId} is domain="${saga.domain}", not "${SagaDomain.SUBSCRIPTION}" — refusing to reprocess via this pipeline.`,
+      const saga = await this.sagaRepository.findOneOrFail({
+        where: { id: sagaId },
+      });
+
+      /* Guard: only subscription-domain sagas flow through this pipeline */
+      if (saga.domain !== SagaDomain.SUBSCRIPTION) {
+        throw new Error(
+          `Saga ${sagaId} is domain="${saga.domain}", not "${SagaDomain.SUBSCRIPTION}" — refusing to reprocess via this pipeline.`,
+        );
+      }
+
+      /* Guard: only FAILED sagas should be replayed */
+      if (saga.status !== SagaStatus.FAILED) {
+        throw new Error(
+          `Saga ${sagaId} is not in FAILED state (current: ${saga.status}).`,
+        );
+      }
+
+      /* Guard: without failure_context we have nothing to replay */
+      if (!saga.failure_context) {
+        throw new Error(`Saga ${sagaId} has no failure_context to replay.`);
+      }
+
+      span?.setAttributes({
+        'saga.routing_key': saga.failure_context.routing_key,
+        'saga.reprocess_count': saga.reprocess_count,
+      });
+
+      await this.eventBus.publishWithRoutingKey(
+        saga.failure_context.routing_key,
+        saga.failure_context.payload,
       );
-    }
 
-    /* Guard: only FAILED sagas should be replayed */
-    if (saga.status !== SagaStatus.FAILED) {
-      throw new Error(
-        `Saga ${sagaId} is not in FAILED state (current: ${saga.status}).`,
-      );
-    }
+      await this.sagaRepository.updateById(sagaId, {
+        status: SagaStatus.RUNNING,
+        reprocess_count: saga.reprocess_count + 1,
+        last_reprocessed_at: new Date().toISOString(),
+      });
 
-    /* Guard: without failure_context we have nothing to replay */
-    if (!saga.failure_context) {
-      throw new Error(`Saga ${sagaId} has no failure_context to replay.`);
-    }
-
-    await this.eventBus.publishWithRoutingKey(
-      saga.failure_context.routing_key,
-      saga.failure_context.payload,
-    );
-
-    await this.sagaRepository.updateById(sagaId, {
-      status: SagaStatus.RUNNING,
-      reprocess_count: saga.reprocess_count + 1,
-      last_reprocessed_at: new Date().toISOString(),
+      span?.addEvent('Saga successfully reprocessed');
     });
   }
 }

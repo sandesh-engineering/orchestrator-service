@@ -1,16 +1,18 @@
-import { SagaEntity, SagaStatus } from './entities/saga.entity';
-import { SagaRepository } from './repositories/saga.repository';
-import { SagaStateDefinition } from './types/saga.types';
-import { RabbitMQEventBus } from './events/event-bus';
-import { DataSource, EntityManager, In, Not } from 'typeorm';
 import { AppError, BAD_REQUEST, CONFLICT } from '@core/main';
 import { logger } from '@platform/logger';
-import {
-  OrchestratorEventType,
-  OrchestratorOutbox,
-} from './entities/orchestrator-outbox.entity';
-
+import type { ConsumeMessage } from '@platform/queue-rabbitmq';
+import { randomUUID } from 'crypto';
+import { DataSource, EntityManager, In, Not } from 'typeorm';
+import { EVENTS } from './constants/saga.constants';
+import { SagaEntity, SagaStatus } from './entities/saga.entity';
+import { OrchestratorOutbox } from './entities/orchestrator-outbox.entity';
+import { OrchestratorEventType } from './enums/orchestrator-event-type.enum';
+import { RabbitMQEventBus } from './events/event-bus';
 import { OrchestratorOutboxRepository } from './repositories/orchestrator-outbox.repository';
+import { SagaRepository } from './repositories/saga.repository';
+import { SagaStateDefinition } from './types/saga.types';
+import { ContextPropagation } from './tracing/propagation/context';
+import { context, trace, withSpan } from '@platform/tracing';
 
 export interface StepSuccessPayload {
   type: 'STEP_SUCCESS';
@@ -24,6 +26,17 @@ export interface StepFailurePayload {
   saga_id: string;
   event_id: string;
   payload: Record<string, unknown>;
+}
+
+interface DomainStepReplyPayload {
+  type?: string;
+  saga_id?: string;
+  event_id?: string;
+  order_id?: string;
+  payload?: {
+    order_id?: string;
+  };
+  [key: string]: unknown;
 }
 
 export class SagaCoordinator {
@@ -53,7 +66,7 @@ export class SagaCoordinator {
    * to `onStepSuccess` or `onStepFailure` depending on their type.
    *
    * @remarks
-   * - Must be called **after** `RabbitMQEventBus.bootstrapRabbitMQ()` so the channel is live.
+   * - Must be called after `RabbitMQEventBus.bootstrapRabbitMQ()` so the channel is live.
    * - Calling it before bootstrap results in an AppError (channel not initialized).
    *
    * @returns {Promise<void>} Resolves when the consumer is registered with the broker.
@@ -63,16 +76,23 @@ export class SagaCoordinator {
       name: this.name,
     });
 
-    await this.eventBus.subscribe((message) => {
+    await this.eventBus.subscribe(async (message) => {
       if (!message) return;
 
       logger.debug('Received raw message on event bus', {
         length: message.content.length,
+        routingKey: message.fields.routingKey,
       });
 
-      const payload = JSON.parse(message.content.toString()) as
-        | StepSuccessPayload
-        | StepFailurePayload;
+      /* Extract the trace context written by publishWithRoutingKey into the
+         AMQP headers so that step-reply spans are children of the original
+         saga dispatch trace rather than new disconnected root traces. */
+      const parentContext = ContextPropagation.extractContext(
+        message.properties?.headers?.trace ?? {},
+      );
+
+      const payload = await this.toSagaStepPayload(message);
+      if (!payload) return;
 
       logger.debug('Parsed event bus message payload', {
         type: payload.type,
@@ -80,10 +100,27 @@ export class SagaCoordinator {
         eventId: payload.event_id,
       });
 
-      if (payload.type === 'STEP_SUCCESS') {
-        this.onStepSuccess(payload);
-      } else if (payload.type === 'STEP_FAILURE') {
-        this.onStepFailure(payload);
+      try {
+        if (payload.type === 'STEP_SUCCESS') {
+          await withSpan(
+            'Saga Step Success',
+            () => this.onStepSuccess(payload),
+            parentContext,
+          );
+        } else if (payload.type === 'STEP_FAILURE') {
+          await withSpan(
+            'Saga Step Failure',
+            () => this.onStepFailure(payload),
+            parentContext,
+          );
+        }
+      } catch (err: unknown) {
+        logger.error('Unhandled error in saga message handler', {
+          type: payload.type,
+          sagaId: payload.saga_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
       }
     });
   }
@@ -103,46 +140,60 @@ export class SagaCoordinator {
     correlation_id: string,
     payload?: Record<string, unknown>,
   ): Promise<{ sagaId: string | undefined; isNew: boolean }> {
-    logger.info('Starting new Saga workflow', {
-      sagaName: this.name,
-      idempotency_key,
-      correlation_id,
-    });
-
-    const result = await this.datasource.transaction(async (manager) => {
-      await manager
-        .createQueryBuilder()
-        .insert()
-        .into(SagaEntity)
-        .values({
-          name: this.name,
-          idempotency_key,
-          correlation_id,
-          // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
-          payload: payload ?? {},
-          current_step_index: 0,
-          status: SagaStatus.PENDING,
-          started_at: new Date().toISOString(),
-        })
-        .orIgnore() /* ON CONFLICT DO NOTHING */
-        .execute();
-
-      return manager.findOne(SagaEntity, {
-        where: { idempotency_key },
+    return withSpan('Start Saga', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttributes({
+        'saga.name': this.name,
+        'saga.idempotency_key': idempotency_key,
+        'saga.correlation_id': correlation_id,
       });
+
+      logger.info('Starting new Saga workflow', {
+        sagaName: this.name,
+        idempotency_key,
+        correlation_id,
+      });
+
+      const result = await this.datasource.transaction(async (manager) => {
+        await manager
+          .createQueryBuilder()
+          .insert()
+          .into(SagaEntity)
+          .values({
+            name: this.name,
+            idempotency_key,
+            correlation_id,
+            // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
+            payload: payload ?? {},
+            current_step_index: 0,
+            status: SagaStatus.PENDING,
+            started_at: new Date().toISOString(),
+          })
+          .orIgnore()
+          .execute();
+
+        return manager.findOne(SagaEntity, {
+          where: { idempotency_key },
+        });
+      });
+
+      const isNew =
+        result?.status === SagaStatus.PENDING && result?.current_step_index === 0;
+
+      span?.setAttributes({
+        'saga.id': result?.id,
+        'saga.is_new': isNew,
+        'saga.status': result?.status,
+      });
+
+      logger.info('Saga start resolved', {
+        sagaId: result?.id,
+        isNew,
+        status: result?.status,
+      });
+
+      return { sagaId: result?.id, isNew };
     });
-
-    /* Checking if the saga record is new or old */
-    const isNew =
-      result?.status === SagaStatus.PENDING && result?.current_step_index === 0;
-
-    logger.info('Saga start resolved', {
-      sagaId: result?.id,
-      isNew,
-      status: result?.status,
-    });
-
-    return { sagaId: result?.id, isNew };
   }
 
   /**
@@ -153,6 +204,12 @@ export class SagaCoordinator {
    * @throws {AppError} If the update fails (already processed).
    */
   private async onStepSuccess(payload: StepSuccessPayload): Promise<void> {
+    const span = trace.getSpan(context.active());
+    span?.setAttributes({
+      'saga.id': payload.saga_id,
+      'saga.event_id': payload.event_id,
+    });
+
     logger.info('Handling step success event', {
       sagaId: payload.saga_id,
       eventId: payload.event_id,
@@ -167,11 +224,17 @@ export class SagaCoordinator {
       return;
     }
 
-    if (sagaRecord.status !== SagaStatus.PENDING) {
-      logger.warn('Saga status is not PENDING, ignoring success event', {
-        sagaId: payload.saga_id,
-        status: sagaRecord.status,
-      });
+    if (
+      sagaRecord.status !== SagaStatus.PENDING &&
+      sagaRecord.status !== SagaStatus.RUNNING
+    ) {
+      logger.warn(
+        'Saga status is not PENDING or RUNNING, ignoring success event',
+        {
+          sagaId: payload.saga_id,
+          status: sagaRecord.status,
+        },
+      );
       return;
     }
 
@@ -189,14 +252,13 @@ export class SagaCoordinator {
         SagaEntity,
         {
           id: payload.saga_id,
-          status: SagaStatus.PENDING,
+          status: In([SagaStatus.PENDING, SagaStatus.RUNNING]),
         },
         {
           // @ts-expect-error - TypeORM QueryBuilder has a known limitation with jsonb columns containing unknown types
-          payload: payload,
+          payload: payload.payload,
           status: isLastStep ? SagaStatus.COMPLETED : SagaStatus.RUNNING,
-          completed_steps: () =>
-            `array_append(completed_steps, '${finishedStep.name}')`,
+          completed_steps: () => this.appendCompletedStepSql(finishedStep.name),
           current_step_index: nextIndex,
         },
       );
@@ -215,14 +277,8 @@ export class SagaCoordinator {
         isLastStep,
       });
 
-      /* Persist in outbox */
       await this.dispatchNextStep({
-        payload: {
-          saga_id: payload.saga_id,
-          event_id: payload.event_id,
-          payload: payload as unknown as Record<string, unknown>,
-          saga_event_type: OrchestratorEventType.COMMAND,
-        },
+        payload: payload.payload,
         sagaId: payload.saga_id,
         manager,
         stepIndex: nextIndex,
@@ -249,6 +305,12 @@ export class SagaCoordinator {
    * @returns {Promise<void>} A promise resolving when compensation processing completes.
    */
   private async onStepFailure(payload: StepFailurePayload): Promise<void> {
+    const span = trace.getSpan(context.active());
+    span?.setAttributes({
+      'saga.id': payload.saga_id,
+      'saga.event_id': payload.event_id,
+    });
+
     logger.warn('Handling step failure event', {
       sagaId: payload.saga_id,
       eventId: payload.event_id,
@@ -274,7 +336,6 @@ export class SagaCoordinator {
       return;
     }
 
-    /* Steps that are to be compensated (In reverse order) */
     const completedStates = sagaRecord.completed_steps
       .map((name) => this.steps.find((s) => s.name === name)!)
       .filter(Boolean)
@@ -315,7 +376,7 @@ export class SagaCoordinator {
             saga_id: payload.saga_id,
             event_id: payload.event_id,
             routing_key: state.compensationRoutingKey,
-            payload: payload as unknown as Record<string, unknown>,
+            payload: payload.payload,
             saga_event_type: OrchestratorEventType.COMPENSATION,
           });
 
@@ -365,7 +426,6 @@ export class SagaCoordinator {
       return;
     }
 
-    /* Get the step that is to be persisted */
     const step = this.steps[stepIndex];
 
     logger.info('Dispatching step command via outbox', {
@@ -375,24 +435,143 @@ export class SagaCoordinator {
     });
 
     const routingKey = step.commandRoutingKey;
+    const eventId = this.createOutboxEventId();
+    const commandPayload = { ...payload, event_id: eventId, saga_id: sagaId };
 
     if (!skipTransaction && manager) {
+      console.log(
+        'active span:',
+        trace.getSpan(context.active())?.spanContext(),
+      );
+      /* Extract the current context of trace */
+      const carrier = ContextPropagation.createCarrier();
+
       const commandInstance = manager.create(OrchestratorOutbox, {
         saga_id: sagaId,
+        event_id: eventId,
         routing_key: routingKey,
-        payload: { ...payload, saga_id: sagaId },
+        payload: commandPayload,
         saga_event_type: OrchestratorEventType.COMMAND,
+        metadata: {
+          trace: carrier,
+        },
       });
 
       await manager.save(OrchestratorOutbox, commandInstance);
     } else {
+      /* Extract the current context of trace */
+      console.log(
+        'active span:',
+        trace.getSpan(context.active())?.spanContext(),
+      );
+      const carrier = ContextPropagation.createCarrier();
+
       await this.sagaOutboxRepository.createAndSaveOutboxRecord({
         saga_id: sagaId,
+        event_id: eventId,
         routing_key: routingKey,
-        payload: { ...payload, saga_id: sagaId },
+        payload: commandPayload,
         saga_event_type: OrchestratorEventType.COMMAND,
+        metadata: {
+          trace: carrier,
+        },
       });
     }
+  }
+
+  /**
+   * Creates the outbox event identifier for an orchestrator command.
+   *
+   * @remarks
+   * - The orchestrator owns command event identity because each emitted command is a distinct event.
+   * - Correlation and saga ids remain stable for saga lookup and idempotency decisions.
+   *
+   * @returns {string} Newly generated UUID for the outbox command event.
+   */
+  private createOutboxEventId(): string {
+    return randomUUID();
+  }
+
+  private async toSagaStepPayload(
+    message: ConsumeMessage,
+  ): Promise<StepSuccessPayload | StepFailurePayload | null> {
+    const raw = JSON.parse(
+      message.content.toString(),
+    ) as DomainStepReplyPayload;
+    const routingKey = message.fields.routingKey;
+    const explicitType = raw.type;
+
+    const type =
+      explicitType === 'STEP_SUCCESS' || explicitType === 'STEP_FAILURE'
+        ? explicitType
+        : this.resolveStepReplyType(routingKey);
+
+    if (!type) {
+      logger.warn('Ignoring unsupported orchestrator message', {
+        routingKey,
+        type: explicitType,
+      });
+      return null;
+    }
+
+    const sagaId = await this.resolveSagaId(raw);
+
+    if (!sagaId) {
+      logger.warn('Ignoring step reply without resolvable saga id', {
+        routingKey,
+        order_id: this.getOrderId(raw),
+      });
+      return null;
+    }
+
+    return {
+      type,
+      saga_id: sagaId,
+      event_id: raw.event_id ?? this.createOutboxEventId(),
+      payload: raw as Record<string, unknown>,
+    };
+  }
+
+  private resolveStepReplyType(
+    routingKey: string,
+  ): StepSuccessPayload['type'] | StepFailurePayload['type'] | null {
+    const successRoutingKeys = new Set<string>([
+      EVENTS.ORDER_ACCEPTED_V1,
+      EVENTS.DISPATCH_CREATED_V1,
+      EVENTS.AGENT_NOTIFIED_V1,
+      EVENTS.AGENT_ASSIGNED_V1,
+    ]);
+
+    const failureRoutingKeys = new Set<string>([
+      EVENTS.ORDER_REJECTED_V1,
+      EVENTS.DISPATCH_CREATION_REJECTED_V1,
+    ]);
+
+    if (successRoutingKeys.has(routingKey)) return 'STEP_SUCCESS';
+    if (failureRoutingKeys.has(routingKey)) return 'STEP_FAILURE';
+    return null;
+  }
+
+  private async resolveSagaId(
+    raw: DomainStepReplyPayload,
+  ): Promise<string | null> {
+    if (raw.saga_id && raw.saga_id !== 'RESOLVED_AT_RUNTIME') {
+      return raw.saga_id;
+    }
+
+    const orderId = this.getOrderId(raw);
+    if (!orderId) return null;
+
+    const saga = await this.sagaRepository.findByCorrelationId(orderId);
+    return saga?.id ?? null;
+  }
+
+  private getOrderId(raw: DomainStepReplyPayload): string | undefined {
+    return raw.order_id ?? raw.payload?.order_id;
+  }
+
+  private appendCompletedStepSql(stepName: string): string {
+    return `completed_steps || '${JSON.stringify([stepName])}'::jsonb`;
   }
 
   async markSagaAsFailed(
@@ -405,27 +584,36 @@ export class SagaCoordinator {
   ) {
     if (!saga_id) {
       logger.warn('Saga id missing. Skipping marking saga as failed!');
+      return;
     }
 
-    const updateMetadata = await this.sagaRepository.update({
-      whereClause: { id: saga_id, status: Not(SagaStatus.FAILED) },
-      payload: {
-        status: SagaStatus.FAILED,
-        failure_context,
-        failed_at: () => 'NOW()',
-      },
+    await withSpan('Mark Saga As Failed', async () => {
+      const span = trace.getSpan(context.active());
+      span?.setAttributes({
+        'saga.id': saga_id,
+        'saga.routing_key': failure_context.routing_key,
+      });
+
+      const updateMetadata = await this.sagaRepository.update({
+        whereClause: { id: saga_id, status: Not(SagaStatus.FAILED) },
+        payload: {
+          status: SagaStatus.FAILED,
+          failure_context,
+          failed_at: () => 'NOW()',
+        },
+      });
+
+      if (updateMetadata.affected === 0) {
+        logger.error('Saga already marked as failed', { sagaId: saga_id });
+        throw new AppError(
+          false,
+          'Saga already marked as failed!',
+          BAD_REQUEST,
+          true,
+        );
+      }
+
+      logger.info('Saga marked as failed!', { sagaId: saga_id });
     });
-
-    if (updateMetadata.affected === 0) {
-      logger.error('Saga already marked as failed', { sagaId: saga_id });
-      throw new AppError(
-        false,
-        'Saga already marked as failed!',
-        BAD_REQUEST,
-        true,
-      );
-    }
-
-    logger.info('Saga marked as failed!', { sagaId: saga_id });
   }
 }

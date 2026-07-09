@@ -1,4 +1,4 @@
-import { SagaDomain } from 'src/enums/saga.domain.enum';
+import { SagaDomain } from '../enums/saga.domain.enum';
 import {
   Column,
   CreateDateColumn,
@@ -6,7 +6,7 @@ import {
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
-import { OrchestratorEventType } from './orchestrator-outbox.entity';
+import { OrchestratorEventType } from '../enums/orchestrator-event-type.enum';
 
 export enum SagaStatus {
   PENDING = 'PENDING',
@@ -63,8 +63,8 @@ export class SagaEntity {
   @Column({ type: 'timestamp', nullable: true })
   last_reprocessed_at!: string | null;
 
-  @Column({ type: 'timestamp' })
-  failed_at!: string;
+  @Column({ type: 'timestamp', nullable: true })
+  failed_at!: string | null;
 
   @CreateDateColumn()
   created_at!: Date;

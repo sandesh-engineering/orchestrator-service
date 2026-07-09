@@ -18,7 +18,8 @@
     "migration:run": "pnpm run typeorm migration:run",
     "migration:revert": "pnpm run typeorm migration:revert",
     "typeorm:prod": "node ./node_modules/typeorm/cli.js -d dist/src/database/data-source.js",
-    "start:prod": "pnpm migration:run && pnpm start"
+    "start:prod": "pnpm migration:run && pnpm start",
+    "mock": "ts-node --transpile-only -r tsconfig-paths/register src/mock/publisher.ts"
   },
   "dependencies": {
     "@core/main": "workspace:*",
@@ -26,6 +27,7 @@
     "@platform/queue-rabbitmq": "workspace:*",
     "@platform/tracing": "workspace:*",
     "dotenv": "^17.2.3",
+    "express": "^5.2.1",
     "p-limit": "^7.3.0",
     "pg": "^8.18.0",
     "prom-client": "^15.1.3",
